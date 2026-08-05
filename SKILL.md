@@ -65,6 +65,15 @@ python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\zhipua
 
 注意：免费视觉模型 QPS 极低（~1.2个/分钟/并发），8355 个媒体文件约需 2 小时+，且旧媒体库已丢失需重跑。
 
+## 模式5: 每日自动增量索引（cron）
+
+已配置 Hermes cron 任务 `gongzuo每日增量索引`（job_id 9ef880df69ed）：
+每天 **04:00** 自动跑 `doc_indexer.py --root D:\BaiduSyncdisk` 增量刷新。
+
+- watchdog 脚本：`C:\Users\xxx13\AppData\Local\hermes\scripts\gongzuo_daily_index.py`
+- 行为：有新增/变更 → 输出摘要；有失败 → 警报；无变化 → 静默
+- 查看运行记录：`cronjob(action='list')`；改投递目标用 `cronjob(action='update', deliver='telegram')`
+
 ## 模式4: 状态查询
 
 ```bash
