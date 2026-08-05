@@ -1,3 +1,10 @@
+<!-- README-PROMO:START -->
+<p align="center">
+  <img src="assets/readme/hero.webp" alt="Gongzuo 离线中文全文检索引擎：秒级搜索 PDF、Office、代码和文本正文" width="100%" />
+  <img src="assets/readme/workflow.webp" alt="Gongzuo 工作流程：本地文档增量索引、中文精准搜索、结果快速打开与定位" width="100%" />
+  <img src="assets/readme/beginner.webp" alt="Gongzuo 新手三步开始：安装依赖、索引文件夹、搜索中文关键词" width="100%" />
+</p>
+<!-- README-PROMO:END -->
 <div align="center">
 
 # Gongzuo 工作
