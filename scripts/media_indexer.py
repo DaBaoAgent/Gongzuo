@@ -1,13 +1,16 @@
 r"""
 媒体文件智能索引器 — 通用版
 ============================
-用智谱 glm-4.6v-flash 分析指定文件夹的所有图片和视频，
-生成结构化描述存入 SQLite FTS5 数据库，支持 jieba 分词秒级检索。
+用视觉大模型(默认阿里百炼 qwen3-vl-plus，可选智谱 glm-4.6v-flash)
+分析指定文件夹的所有图片和视频，生成结构化描述存入 SQLite FTS5 数据库，
+支持 jieba 分词秒级检索。
 
 用法:
   python media_indexer.py --root "D:\SomeFolder" [--db PATH] [--workers N]
+                         [--provider dashscope|zhipu] [--model MODEL]
+                         [--limit N] [--shuffle]
 
-依赖: Pillow, jieba, ffmpeg/ffprobe, GLM_API_KEY in ~/.hermes/.env
+依赖: Pillow, jieba, ffmpeg/ffprobe, DASHSCOPE_API_KEY 或 GLM_API_KEY in ~/.hermes/.env
 """
 from __future__ import annotations
 import argparse
@@ -38,8 +41,27 @@ MAX_IMAGE_PX = 1024
 VIDEO_KEYFRAMES = 3
 BATCH_LOG_EVERY = 50
 
-ZHIPU_HOST = "open.bigmodel.cn"
-ZHIPU_CHAT_PATH = "/api/paas/v4/chat/completions"
+# ── 视觉模型 Provider ────────────────────────────────────────────────
+PROVIDERS = {
+    "dashscope": {  # 阿里百炼（默认）
+        "host": "dashscope.aliyuncs.com",
+        "path": "/compatible-mode/v1/chat/completions",
+        "env_key": "DASHSCOPE_API_KEY",
+        "default_model": "qwen3-vl-plus",
+    },
+    "zhipu": {  # 智谱（原默认）
+        "host": "open.bigmodel.cn",
+        "path": "/api/paas/v4/chat/completions",
+        "env_key": "GLM_API_KEY",
+        "default_model": "glm-4.6v-flash",
+    },
+}
+PROVIDER = "dashscope"   # 全局默认 provider（--provider 覆盖）
+MODEL = None             # 全局模型（None 时用 provider 默认模型）
+MIN_IMAGE_PX = 128       # qwen3-vl 拒绝过小图片(<100px 会 400)，小于此值放大
+TOTAL_PROMPT_TOKENS = 0          # 成本统计（多线程累加，仅估算）
+TOTAL_COMPLETION_TOKENS = 0
+TOKEN_LOCK = Lock()
 
 
 def setup_logging(log_path: str):
@@ -110,27 +132,40 @@ def is_already_indexed(conn, file_path: str, mtime: str) -> bool:
     return row is not None
 
 
-# ── 智谱 API ───────────────────────────────────────────────────────────
-def _get_api_key() -> str:
-    key = os.environ.get("GLM_API_KEY", "").strip()
+# ── 视觉 API ─────────────────────────────────────────────────────────
+def _get_api_key(env_key: str) -> str:
+    key = os.environ.get(env_key, "").strip()
     if key:
         return key
-    env_path = os.path.expanduser("~/.hermes/.env")
-    if os.path.exists(env_path):
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("GLM_API_KEY"):
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if key:
-                        return key
-    raise RuntimeError("GLM_API_KEY not found in env or ~/.hermes/.env")
+    env_candidates = [
+        os.path.expanduser("~/.hermes/.env"),
+        r"D:\@佳康顺矩阵\hermes\.env",
+    ]
+    for env_path in env_candidates:
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith(env_key):
+                        key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if key:
+                            return key
+    raise RuntimeError(f"{env_key} not found in env or {env_candidates}")
 
 
-def call_glm4v_flash(prompt: str, image_base64: str = None, image_url: str = None) -> str:
-    api_key = _get_api_key()
+def call_vision(prompt: str, image_base64: str = None, image_url: str = None,
+                provider: str = None, model: str = None) -> str:
+    """调用视觉模型(OpenAI 兼容格式)，provider 见 PROVIDERS 字典"""
+    global TOTAL_PROMPT_TOKENS, TOTAL_COMPLETION_TOKENS
+    provider = provider or PROVIDER
+    if provider not in PROVIDERS:
+        raise RuntimeError(f"未知 provider: {provider}，可选 {list(PROVIDERS.keys())}")
+    cfg = PROVIDERS[provider]
+    api_key = _get_api_key(cfg["env_key"])
+    model = model or MODEL or cfg["default_model"]
+
     content = [{"type": "text", "text": prompt}]
     if image_base64:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}})
@@ -138,7 +173,7 @@ def call_glm4v_flash(prompt: str, image_base64: str = None, image_url: str = Non
         content.append({"type": "image_url", "image_url": {"url": image_url}})
 
     body = {
-        "model": "glm-4.6v-flash",
+        "model": model,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 500,
         "temperature": 0.1,
@@ -146,26 +181,36 @@ def call_glm4v_flash(prompt: str, image_base64: str = None, image_url: str = Non
 
     for attempt in range(MAX_RETRIES):
         try:
-            c = http.client.HTTPSConnection(ZHIPU_HOST, timeout=API_TIMEOUT)
+            c = http.client.HTTPSConnection(cfg["host"], timeout=API_TIMEOUT)
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            c.request("POST", ZHIPU_CHAT_PATH, body=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=headers)
+            c.request("POST", cfg["path"], body=json.dumps(body, ensure_ascii=False).encode("utf-8"), headers=headers)
             resp = c.getresponse()
             raw = resp.read().decode("utf-8")
             c.close()
             data = json.loads(raw)
             if "error" in data:
                 err_msg = data["error"].get("message", str(data["error"]))
-                if "rate" in err_msg.lower() or "limit" in err_msg.lower():
+                if "rate" in err_msg.lower() or "limit" in err_msg.lower() or "throttl" in err_msg.lower():
                     time.sleep(5 * (attempt + 1))
                     continue
                 raise RuntimeError(f"API error: {err_msg[:300]}")
             choices = data.get("choices", [])
             if choices:
+                usage = data.get("usage", {})
+                if usage:
+                    with TOKEN_LOCK:
+                        TOTAL_PROMPT_TOKENS += usage.get("prompt_tokens", 0)
+                        TOTAL_COMPLETION_TOKENS += usage.get("completion_tokens", 0)
                 return choices[0].get("message", {}).get("content", "").strip()
             raise RuntimeError(f"Empty choices: {raw[:300]}")
         except (http.client.HTTPException, ConnectionError, TimeoutError) as e:
             time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"Failed after {MAX_RETRIES} attempts")
+
+
+def call_glm4v_flash(prompt: str, image_base64: str = None, image_url: str = None) -> str:
+    """兼容旧调用：等价于 call_vision(..., provider='zhipu')"""
+    return call_vision(prompt, image_base64=image_base64, image_url=image_url, provider="zhipu")
 
 
 # ── JSON解析 ───────────────────────────────────────────────────────────
@@ -184,10 +229,10 @@ def parse_json_response(text: str) -> dict:
     try:
         t = text.strip()
         if t.startswith("```"):
-            t = re.sub(r'^```\\w*\\n?', '', t)
-            t = re.sub(r'\\n?```$', '', t)
+            t = re.sub(r'^```\w*\n?', '', t)
+            t = re.sub(r'\n?```$', '', t)
             t = t.strip()
-        m = re.search(r'\\{.*\\}', t, re.DOTALL)
+        m = re.search(r'\{.*\}', t, re.DOTALL)
         if m:
             parsed = json.loads(m.group())
             parsed["details"] = _safe_str(parsed.get("details", ""))
@@ -211,6 +256,10 @@ def resize_image_to_base64(file_path: str, max_px: int = MAX_IMAGE_PX) -> tuple:
     if max(orig_w, orig_h) > max_px:
         ratio = max_px / max(orig_w, orig_h)
         img = img.resize((int(orig_w * ratio), int(orig_h * ratio)), Image.LANCZOS)
+    elif max(orig_w, orig_h) < MIN_IMAGE_PX:
+        # qwen3-vl 拒绝过小图片(如 1x1 纯色会 HTTP 400)，放大到最小边
+        ratio = MIN_IMAGE_PX / max(orig_w, orig_h)
+        img = img.resize((max(1, int(orig_w * ratio)), max(1, int(orig_h * ratio))), Image.NEAREST)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode("ascii"), (orig_w, orig_h)
@@ -229,7 +278,7 @@ IMAGE_PROMPT = """请仔细观察这张图片，提供以下信息：
 
 def analyze_image(file_path: str) -> dict:
     b64, (w, h) = resize_image_to_base64(file_path)
-    result_text = call_glm4v_flash(IMAGE_PROMPT, image_base64=b64)
+    result_text = call_vision(IMAGE_PROMPT, image_base64=b64)
     parsed = parse_json_response(result_text)
     return {
         "description": parsed.get("description", ""),
@@ -310,13 +359,13 @@ def analyze_video(file_path: str, log=None) -> dict:
     for b64, ts in frames:
         time_str = f"{int(ts//60):02d}:{int(ts%60):02d}"
         prompt = VIDEO_FRAME_PROMPT.format(time_str=time_str)
-        desc = call_glm4v_flash(prompt, image_base64=b64)
+        desc = call_vision(prompt, image_base64=b64)
         frame_descriptions.append(f"[{time_str}] {desc}")
         time.sleep(0.3)
 
     frame_text = "\n".join(frame_descriptions)
     summary_prompt = VIDEO_SUMMARY_PROMPT.format(count=len(frames), frame_descriptions=frame_text)
-    summary_text = call_glm4v_flash(summary_prompt)
+    summary_text = call_vision(summary_prompt)
     parsed = parse_json_response(summary_text)
 
     return {
@@ -410,23 +459,33 @@ def process_single_file(item, conn, lock, log):
 
 # ── 主流程 ──────────────────────────────────────────────────────────────
 def main():
+    # Override globals（必须最先声明，argparse 默认值会读取模块全局）
+    global MAX_IMAGE_PX, VIDEO_KEYFRAMES, MAX_WORKERS, PROVIDER, MODEL
+
     parser = argparse.ArgumentParser(description="媒体文件智能索引器")
     parser.add_argument("--root", required=True, help="扫描根目录")
     parser.add_argument("--db", default=None, help="数据库路径 (默认: <root>/media_index.db)")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="并发线程数")
     parser.add_argument("--max-image-px", type=int, default=MAX_IMAGE_PX, help="图片缩放最大边长")
     parser.add_argument("--video-keyframes", type=int, default=VIDEO_KEYFRAMES, help="视频关键帧数")
+    parser.add_argument("--provider", choices=list(PROVIDERS.keys()), default=PROVIDER,
+                        help="视觉模型厂商 (dashscope=阿里百炼默认 / zhipu=智谱)")
+    parser.add_argument("--model", default=None, help="视觉模型名 (默认取 provider 默认模型)")
+    parser.add_argument("--limit", type=int, default=0, help="只处理前 N 个未索引文件 (0=全部，用于分批/试跑)")
+    parser.add_argument("--shuffle", action="store_true", help="随机打乱处理顺序 (试跑取样用)")
+    parser.add_argument("--images-only", action="store_true", help="只处理图片，跳过视频")
     args = parser.parse_args()
 
     scan_root = os.path.abspath(args.root)
     db_path = args.db or os.path.join(os.path.dirname(scan_root), "media_index.db")
     log_path = os.path.join(os.path.dirname(db_path), "indexer.log")
 
-    # Override globals
-    global MAX_IMAGE_PX, VIDEO_KEYFRAMES, MAX_WORKERS
+    # Override globals（已在上方声明）
     MAX_IMAGE_PX = args.max_image_px
     VIDEO_KEYFRAMES = args.video_keyframes
     MAX_WORKERS = args.workers
+    PROVIDER = args.provider
+    MODEL = args.model
 
     log = setup_logging(log_path)
     start = time.time()
@@ -436,6 +495,7 @@ def main():
     log.info(f"扫描根目录: {scan_root}")
     log.info(f"数据库: {db_path}")
     log.info(f"并发: {MAX_WORKERS} 线程")
+    log.info(f"视觉模型: {PROVIDERS[PROVIDER]['env_key']} / {MODEL or PROVIDERS[PROVIDER]['default_model']}")
     log.info("=" * 60)
 
     conn = init_db(db_path)
@@ -445,12 +505,23 @@ def main():
     files = scan_files(scan_root)
     images = [f for f in files if f[4] == "image"]
     videos = [f for f in files if f[4] == "video"]
+    if args.images_only:
+        files = images
+        videos = []
+        log.info("--images-only: 只处理图片，跳过视频")
     log.info(f"发现 {len(images)} 张图片, {len(videos)} 个视频 (共 {len(files)} 个文件)")
 
     already = sum(1 for f in files if is_already_indexed(conn, f[0], f[3]))
     log.info(f"已索引: {already}, 待处理: {len(files) - already}")
 
     files.sort(key=lambda f: (0 if f[4] == "image" else 1, f[2]))
+
+    if args.shuffle:
+        import random
+        random.shuffle(files)
+    if args.limit and args.limit > 0:
+        files = files[: args.limit]
+        log.info(f"分批模式: 本次只处理前 {args.limit} 个文件")
 
     done = ok_count = err_count = skip_count = 0
     total = len(files)
@@ -480,6 +551,9 @@ def main():
     log.info("=" * 60)
     log.info(f"索引完成! 耗时: {elapsed/60:.1f}分钟")
     log.info(f"总计: {total}, 成功: {ok_count}, 跳过: {skip_count}, 失败: {err_count}")
+    if TOTAL_PROMPT_TOKENS or TOTAL_COMPLETION_TOKENS:
+        log.info(f"Token 消耗: 输入 {TOTAL_PROMPT_TOKENS:,} / 输出 {TOTAL_COMPLETION_TOKENS:,} "
+                 f"(约 {TOTAL_PROMPT_TOKENS + TOTAL_COMPLETION_TOKENS:,} tokens, 费用以百炼账单为准)")
     log.info(f"数据库: {db_path}")
     log.info("=" * 60)
 

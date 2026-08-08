@@ -63,17 +63,24 @@ python scripts/file_search.py --stats                      # 库状态
 **日常问答模式**：用户随口问资料/账号/文件类问题（如"我的QQ机器人账号有哪些"、"提成规则是啥"）时，
 直接用 file_search.py 查库秒回，不要重新扫描、不要问用户想找什么文件。答案给出文件路径+关键内容。
 
-## 模式3: 媒体 AI 描述索引（media_indexer.py，原功能）
+## 模式3: 媒体 AI 描述索引（media_indexer.py）
 
 仅当需要图片/视频的**内容语义**搜索时使用（如"找电动轮椅的产品图"）：
 
 ```bash
-python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\@kaifa\gongzuo-data\media_index.db" --workers 3
-python scripts/enhance_segmentation.py --db "D:\@kaifa\gongzuo-data\media_index.db"
-python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\@kaifa\gongzuo-data\media_index.db"  # 回填到全文件库
+# 阿里百炼 qwen3-vl-plus（默认，推荐：~0.002元/张，8并发≈150张/分）
+python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\media_index.db" --workers 8 --provider dashscope
+# 智谱 glm-4.6v-flash（免费但 QPS 极低 ~1.2个/分/并发）
+python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\media_index.db" --workers 3 --provider zhipu
+# 分批/试跑: --limit N --shuffle（随机取样）；断点续传: 重跑自动跳过 path+mtime 未变
+python scripts/enhance_segmentation.py --db "D:\zhipuai_test\media_index.db"
+python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\zhipuai_test\media_index.db"  # 回填到全文件库
 ```
 
-注意：免费视觉模型 QPS 极低（~1.2个/分钟/并发），8355 个媒体文件约需 2 小时+，且旧媒体库已丢失需重跑。
+- `--provider dashscope|zhipu`（默认 dashscope）、`--model` 自定义模型、`--limit N`/`--shuffle` 分批试跑
+- 依赖: `DASHSCOPE_API_KEY`（百炼）或 `GLM_API_KEY`（智谱），写在 `~/.hermes/.env` 或 `D:\@佳康顺矩阵\hermes\.env`
+- 脚本自动累计 token 消耗并在结束时打印（费用以百炼账单为准）
+- 已知坑: qwen3-vl 拒绝 <100px 小图（脚本自动放大兜底）；json 解析正则应写单反斜杠 `\{.*\}`（双反斜杠会永远解析失败，2026-08 已修复）
 
 ## 模式5: 每日自动增量索引（cron）
 
@@ -135,7 +142,8 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 - 全文件索引: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile
 - 搜索: jieba（本机已装）
 - 图片OCR: Umi-OCR exe(D:\@kaifa\Umi-OCR\,skill: umi-ocr), Pillow, pillow-heif(HEIC)
-- 媒体AI: 智谱 GLM_API_KEY, Pillow, ffmpeg/ffprobe
+- 视频OCR: ffmpeg/ffprobe (C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin)
+- 媒体AI: 百炼 DASHSCOPE_API_KEY 或智谱 GLM_API_KEY, Pillow, jieba, ffmpeg/ffprobe
 - 系统: antiword（git-bash 自带 /mingw64/bin）
 
 ## 已知坑
