@@ -34,7 +34,7 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)  # jieba/pkg_resources 弃用噪音
 
-DEFAULT_DB = r"D:\zhipuai_test\file_index.db"
+DEFAULT_DB = r"D:\@kaifa\gongzuo-data\file_index.db"
 LIKE_SPAN = 20_000  # LIKE 兜底扫描的正文长度(每文件前2万字)
 
 _HIL = "\033[31m"  # 高亮色(红)
@@ -112,7 +112,8 @@ def search(conn: sqlite3.Connection, query: str, ext=None, folder=None,
         sql = (f"SELECT m.id, m.file_path, m.file_name, m.file_ext, m.file_size, m.file_mtime, "
                f"m.folder_path, m.is_media, m.doc_type, m.content_preview, rank AS r "
                f"FROM files m JOIN files_search ON files_search.rowid = m.id "
-               f"WHERE {' AND '.join(conds + short_conds)} ORDER BY r LIMIT ?")
+               f"WHERE {' AND '.join(conds + short_conds)} "
+               f"ORDER BY CASE WHEN m.is_media=1 THEN 0 ELSE 1 END, r LIMIT ?")
         params = [match_expr, *base_params, *short_params, limit]
         try:
             rows = conn.execute(sql, params).fetchall()
@@ -131,7 +132,8 @@ def search(conn: sqlite3.Connection, query: str, ext=None, folder=None,
         sql = (f"SELECT m.id, m.file_path, m.file_name, m.file_ext, m.file_size, m.file_mtime, "
                f"m.folder_path, m.is_media, m.doc_type, m.content_preview, 0 AS r "
                f"FROM files m WHERE {' AND '.join(conds2)} "
-               f"ORDER BY CASE WHEN m.file_name LIKE ? THEN 0 ELSE 1 END, m.file_mtime DESC LIMIT ?")
+               f"ORDER BY CASE WHEN m.is_media=1 THEN 0 ELSE 1 END, "
+               f"CASE WHEN m.file_name LIKE ? THEN 0 ELSE 1 END, m.file_mtime DESC LIMIT ?")
         rows = conn.execute(sql, params2 + [f"%{query}%", limit]).fetchall()
         used = "LIKE"
     return rows, toks

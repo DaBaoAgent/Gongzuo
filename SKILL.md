@@ -8,6 +8,11 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 
 # 文件智能索引与秒级检索 (gongzuo)
 
+> **🔄 合并说明（2026-08-09）**：本技能为"本地文件/媒体索引检索"唯一伞形入口，已吸收两个重叠技能：
+> - `media-indexer` → 其视觉媒体索引能力本文"模式3"已完整覆盖；新增 `references/indexer-patterns.md`（视觉API调用/JSON解析/多线程坑的工程模式）
+> - `local-file-index` → 其工程模式（FTS5 trigram/提取兜底链/增量）本文已完整覆盖；新增 `references/doc-extraction-fallbacks.md`（各格式提取失败签名与正解）
+> - 检索前先 `file_search.py --stats` 确认库存在（历史教训：库目录被清理后 watchdog 全失效）。
+
 ## 概述
 
 统一索引方案，一个本地 SQLite 库覆盖两类检索：
@@ -22,10 +27,14 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 ## 模式1: 全文件索引（doc_indexer.py）
 
 ```bash
-python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\file_index.db" [--workers 8]
+python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --db "D:\@kaifa\gongzuo-data\file_index.db" [--workers 8]
 # 增量：重跑自动跳过 path+mtime+size 未变的文件，只处理新增/变更
+# 图片OCR（Umi-OCR 本地识别，断点续传，可反复重跑）:
+python scripts/doc_indexer.py --ocr-media
+# 仅扫描件PDF识别:
+python scripts/doc_indexer.py --ocr-pdf
 # 媒体描述回填（媒体库存在时）:
-python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\zhipuai_test\media_index.db"
+python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\@kaifa\gongzuo-data\media_index.db"
 ```
 
 - 噪音自动排除：node_modules / .git / .cache / .codex_* / 字体(.ttf) / 资源映射(.map) / 二进制(.exe) 等
@@ -49,6 +58,7 @@ python scripts/file_search.py --stats                      # 库状态
 ```
 
 搜索策略：jieba 分词 → ≥3字词组 FTS5 trigram 精准匹配 → <3字 LIKE 兜底（文件名+目录+预览+正文前2万字）→ 零命中自动降级全子串 LIKE。
+**媒体优先排序**：命中结果按 `is_media=1 优先` 排列，图片/视频排最前——找图（OCR文字/文件名命中）时不用翻长文档。
 
 **日常问答模式**：用户随口问资料/账号/文件类问题（如"我的QQ机器人账号有哪些"、"提成规则是啥"）时，
 直接用 file_search.py 查库秒回，不要重新扫描、不要问用户想找什么文件。答案给出文件路径+关键内容。
@@ -58,9 +68,9 @@ python scripts/file_search.py --stats                      # 库状态
 仅当需要图片/视频的**内容语义**搜索时使用（如"找电动轮椅的产品图"）：
 
 ```bash
-python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\media_index.db" --workers 3
-python scripts/enhance_segmentation.py --db "D:\zhipuai_test\media_index.db"
-python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\zhipuai_test\media_index.db"  # 回填到全文件库
+python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\@kaifa\gongzuo-data\media_index.db" --workers 3
+python scripts/enhance_segmentation.py --db "D:\@kaifa\gongzuo-data\media_index.db"
+python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\@kaifa\gongzuo-data\media_index.db"  # 回填到全文件库
 ```
 
 注意：免费视觉模型 QPS 极低（~1.2个/分钟/并发），8355 个媒体文件约需 2 小时+，且旧媒体库已丢失需重跑。
@@ -96,11 +106,27 @@ trigram 按 3 字子串建倒排索引：`MATCH '"电动轮椅"'` 精准命中�
 |------|------|----------|
 | txt/md/json/yaml/csv/html/js/py… | 编码探测直读 | 二进制检测→跳过 |
 | docx/xlsx/pptx | python-docx/openpyxl/python-pptx | — |
-| pdf | PyMuPDF 逐页(≤500页) | 扫描件无文字层→搜不到(需OCR) |
+| pdf | PyMuPDF 逐页(≤500页) | 无文字层(扫描件)→ `--ocr-pdf` 用 Umi-OCR 逐页渲染识别 |
 | doc(老格式) | antiword -m UTF-8 | RTF/HTML伪装嗅探→olefile UTF-16流抽可读段 |
 | xls | xlrd | — |
 | epub/xmind/odt | zip 解包抽文本/标题 | — |
-| 媒体(jpg/mp4…) | 元数据 only | 描述靠 --merge-media 回填 |
+| 图片 jpg/png/bmp/webp/tif | 元数据 only | `--ocr-media` 用 Umi-OCR 提取图中文字 |
+| 图片 heic/heif/psd | 元数据 only | Pillow(pillow-heif) 转 PNG 后 Umi-OCR |
+| 视频/音频 | 元数据 only | 描述靠 --merge-media 回填 |
+
+### Umi-OCR 图片识别集成（模式1.5）
+
+`doc_indexer.py --ocr-media` 会调用本机 Umi-OCR(127.0.0.1:1224)给**无正文图片**提取文字入库：
+
+- 覆盖 jpg/jpeg/png/webp/bmp/tif + heic/heif/psd(Pillow 转换)，超大图自动缩至 2880px
+- **断点续传**：已有 content_text 的跳过；失败标 `ERR|OCR|...` 下次重跑自动重试
+- **单线程**跑（Umi-OCR 后端并发差，勿加 workers）；~0.2-1s/张
+- 无文字图片标记 `【无文字图片】`（doc_type=media-ocr-notext），避免反复重试
+- 全量 8296 张约 1.5-2.5 小时；增量只处理新增/失败，秒级
+- 依赖：Umi-OCR exe 已装 `D:\@kaifa\Umi-OCR\`（**单图/交互式识别用 umi-ocr 技能**），Pillow + pillow-heif
+- 坑：HEIC 必须 `from pillow_heif import register_heif_opener; register_heif_opener()` 再 Image.open，否则 cannot identify
+- 坑：伪装 HEIC（扩展名 .jpg 但内容 ftyp 魔数）→ `_image_to_b64` 已做 ftyp 嗅探自动转换，Umi-OCR 报 code=301 imdecode failed 时先查这个
+- 坑：超大图(>30MB)直接送 OCR 会卡死 → 已自动跳过；手机原图缩 720p 提速（详见 umi-ocr 技能 Pitfalls）
 
 ### jieba 分词（搜索端）
 file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期开销。
@@ -108,6 +134,7 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 ### 依赖
 - 全文件索引: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile
 - 搜索: jieba（本机已装）
+- 图片OCR: Umi-OCR exe(D:\@kaifa\Umi-OCR\,skill: umi-ocr), Pillow, pillow-heif(HEIC)
 - 媒体AI: 智谱 GLM_API_KEY, Pillow, ffmpeg/ffprobe
 - 系统: antiword（git-bash 自带 /mingw64/bin）
 
@@ -117,7 +144,7 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 - **FTS5 trigram 只认 ≥3 字符**：2字中文词自动走 LIKE，别惊讶命中方式不同
 - 超大文件(>100万字符)正文截断，超限部分搜不到
 - 老 .doc（WPS/加密/损坏）部分失败，error 标记 `PERMANENT|...` 不再重试
-- 原媒体库 D:\zhipuai_test\media_index.db **已不存在**（2026-08 核实），需重跑 media_indexer.py
+- 原媒体库 D:\@kaifa\gongzuo-data\media_index.db 需重跑 media_indexer.py 重建
 - 模型ID/免费模型限速问题见 references/zhipuai-model-history.md
 - doc_indexer.py 的 log 写在库同目录 doc_indexer.log
 
@@ -125,8 +152,7 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 
 | 库 | 内容 | 状态 |
 |----|------|------|
-| D:\zhipuai_test\file_index.db | 全文件正文+媒体元数据 | 11,225 文件 (1,564 文档正文 + 9,720 媒体元数据)，99MB，失败 1（二进制webgl库） |
-| D:\zhipuai_test\media_index.db | 媒体AI描述(旧) | 已丢失，可重跑重建 |
+| D:\@kaifa\gongzuo-data\file_index.db | 全文件正文+媒体元数据+图片OCR文字 | 12,076 文件；图片 OCR 全量完成 2026-08-09：6,344 识别 + 846 无文字 + 30 超大跳过 + 16 扫描PDF，0 失败 |
 
 ## 参考文档
 

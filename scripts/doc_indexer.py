@@ -17,7 +17,7 @@ doc/xls/epub/xmind/代码/配置…），图片/视频/音频只收录元数据�
 
 用法:
   python doc_indexer.py --root "D:\BaiduSyncdisk" [--db PATH] [--workers N]
-  python doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media D:\zhipuai_test\media_index.db
+  python doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media D:\@kaifa\gongzuo-data\media_index.db
   python doc_indexer.py --db PATH --stats
 
 依赖: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile, jieba(查询端用)
@@ -25,13 +25,19 @@ doc/xls/epub/xmind/代码/配置…），图片/视频/音频只收录元数据�
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
+import time
+import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -39,7 +45,7 @@ from threading import Lock
 
 # ── 默认配置 ────────────────────────────────────────────────────────────
 DEFAULT_ROOT = r"D:\BaiduSyncdisk"
-DEFAULT_DB = r"D:\zhipuai_test\file_index.db"
+DEFAULT_DB = r"D:\@kaifa\gongzuo-data\file_index.db"
 MAX_WORKERS = 8
 MAX_TEXT_CHARS = 1_000_000          # 单文件正文入库上限（超限截断，防日志/大PDF撑爆库）
 MAX_PDF_PAGES = 500
@@ -84,6 +90,36 @@ SKIP_NAMES = {
     "thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store",
     ".ds_store", "icon\r", "autorun.inf", ".gitignore.swp",
 }
+
+# ── Umi-OCR 本地识别集成 ───────────────────────────────────────────────
+# 图片 → Umi-OCR 提取正文；PDF 无文字层（扫描件）→ 渲染页 → Umi-OCR
+UMI_PORT = 1224
+UMI_HOST = "127.0.0.1"
+UMI_EXE_CANDIDATES = [
+    r"D:\@kaifa\Umi-OCR\Umi-OCR_Rapid_v2.1.5\Umi-OCR.exe",
+    r"D:\@kaifa\Umi-OCR\Umi-OCR.exe",
+]
+UMI_LANG_HINTS = {
+    "ch": ["简体中文", "models/config_chinese.txt", "chinese"],
+    "en": ["English", "models/config_en.txt", "english"],
+    "cht": ["繁體中文", "models/config_chinese_cht(v2).txt"],
+}
+# Umi-OCR 直接支持的图片扩展名
+UMI_IMG_EXTS = {".jpg", ".jpe", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+# 可用 Pillow 转 PNG 后交给 Umi-OCR 的扩展名（HEIC/PSD 等）
+PIL_CONVERT_EXTS = {".heic", ".heif", ".psd"}
+OCR_EXTS = UMI_IMG_EXTS | PIL_CONVERT_EXTS
+OCR_PDF_PAGES = 30          # 扫描件 PDF 最多 OCR 页数
+OCR_MAX_IMG_SIDE = 2880     # 超过此边长先等比缩小（Umi-OCR 提速）
+OCR_HEIC_MAX_SIDE = 1280    # HEIC 手机原图缩到 720p 级再识别（上传体积-90%，提速5倍+）
+OCR_MAX_FILE_MB = 30        # 超过此大小的图片跳过 OCR（产品原图/PSD 照片，避免卡死）
+OCR_NO_TEXT_MARK = "【无文字图片】"
+# ── 视频抽帧 OCR ───────────────────────────────────────────────────────
+FFMPEG_BIN = r"C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin\ffmpeg.exe"
+FFPROBE_BIN = r"C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin\ffprobe.exe"
+VIDEO_FRAME_INTERVAL = 2.0  # 每 N 秒抽 1 帧
+VIDEO_OCR_MAX_FRAMES = 600  # 单视频最多 OCR 帧数（防超长视频拖死）
+VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".mts", ".ts", ".m4v", ".avi", ".wmv", ".flv", ".3gp", ".mpg", ".mpeg"}
 
 
 # 纯文本类扩展名（编码探测后直接入库）
@@ -218,6 +254,178 @@ def _cell_text(v) -> str:
     return str(v)
 
 
+# ── Umi-OCR 客户端 ─────────────────────────────────────────────────────
+def _umi_is_up(timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((UMI_HOST, UMI_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _umi_find_exe() -> str | None:
+    for p in UMI_EXE_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    base = r"D:\@kaifa"
+    if os.path.isdir(base):
+        for root, _, files in os.walk(base):
+            if "Umi-OCR.exe" in files and "UmiOCR-data" in os.listdir(root):
+                return os.path.join(root, "Umi-OCR.exe")
+    return None
+
+
+def umi_ensure_running(max_wait: int = 60) -> bool:
+    """确保 Umi-OCR 在运行，未运行则启动。返回是否就绪。"""
+    if _umi_is_up():
+        return True
+    exe = _umi_find_exe()
+    if not exe:
+        return False
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", exe],
+            cwd=os.path.dirname(exe),
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception:
+        return False
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if _umi_is_up():
+            return True
+        time.sleep(1)
+    return False
+
+
+def _umi_fetch_options() -> dict:
+    try:
+        resp = urllib.request.urlopen(
+            f"http://{UMI_HOST}:{UMI_PORT}/api/ocr/get_options", timeout=10
+        )
+        return json.loads(resp.read().decode())
+    except Exception:
+        return {}
+
+
+def umi_build_options(lang: str = "ch", parser: str = "multi_para", limit_side: int = OCR_MAX_IMG_SIDE) -> dict:
+    """动态构造 options，兼容 Rapid/Paddle 两种引擎。"""
+    opts_def = _umi_fetch_options()
+    options = {"data.format": "text", "tbpu.parser": parser}
+    if "ocr.language" in opts_def:
+        allowed = opts_def["ocr.language"].get("optionsList", [])
+        allowed_vals = {str(v[0]) for v in allowed}
+        for hint in UMI_LANG_HINTS.get(lang, []):
+            if hint in allowed_vals:
+                options["ocr.language"] = hint
+                break
+    if "ocr.maxSideLen" in opts_def:
+        options["ocr.maxSideLen"] = limit_side
+    elif "ocr.limit_side_len" in opts_def:
+        options["ocr.limit_side_len"] = limit_side
+    if "ocr.angle" in opts_def:
+        options["ocr.angle"] = True
+    elif "ocr.cls" in opts_def:
+        options["ocr.cls"] = True
+    return options
+
+
+def umi_ocr_image(path: str, options: dict) -> str:
+    """识别一张图，返回纯文本。异常抛出。"""
+    b64 = _image_to_b64(path)
+    payload = json.dumps({"base64": b64, "options": options}).encode()
+    req = urllib.request.Request(
+        f"http://{UMI_HOST}:{UMI_PORT}/api/ocr",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    resp = urllib.request.urlopen(req, timeout=180)
+    r = json.loads(resp.read().decode())
+    if r.get("code") == 100:
+        return (r.get("data") or "").strip()
+    if r.get("code") == 101:
+        return ""  # 无文本
+    raise RuntimeError(f"umi-ocr code={r.get('code')} {str(r.get('data'))[:200]}")
+
+
+def _image_to_b64(path: str) -> str:
+    """读取图片为 base64。PIL_CONVERT_EXTS（HEIC/PSD）用 Pillow 转 PNG；超大图缩小。"""
+    ext = os.path.splitext(path)[1].lower()
+    # 伪装检测：扩展名 .jpg 但实际是 HEIC（ftyp 魔数）→ 走 Pillow 转换路径
+    disguised_heic = False
+    if ext in UMI_IMG_EXTS:
+        try:
+            with open(path, "rb") as f:
+                if f.read(12)[4:8] == b"ftyp":
+                    disguised_heic = True
+        except OSError:
+            pass
+    need_convert = (ext in PIL_CONVERT_EXTS) or disguised_heic or _img_side_too_big(path)
+    if need_convert:
+        from PIL import Image
+        if ext in (".heic", ".heif") or disguised_heic:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        with Image.open(path) as im:
+            im.load()
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGB")
+            w, h = im.size
+            # HEIC 手机原图 → 720p 级（最长边 1280）加速；其他超限图 → 2880
+            target = OCR_HEIC_MAX_SIDE if (ext in (".heic", ".heif") or disguised_heic) else OCR_MAX_IMG_SIDE
+            if max(w, h) > target:
+                scale = target / max(w, h)
+                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            return base64.b64encode(buf.getvalue()).decode()
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def _img_side_too_big(path: str) -> bool:
+    """边长超 OCR_MAX_IMG_SIDE 返回 True。读取失败视为 False（交给 Umi-OCR 自己处理）。"""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            w, h = im.size
+        return max(w, h) > OCR_MAX_IMG_SIDE
+    except Exception:
+        return False
+
+
+def umi_ocr_pdf(path: str, options: dict, max_pages: int = OCR_PDF_PAGES) -> str:
+    """扫描件 PDF：逐页渲染 PNG → Umi-OCR，拼接文本。返回 (文本, ocr页数)。"""
+    import fitz
+    doc = fitz.open(path)
+    parts = []
+    pages_done = 0
+    try:
+        for i, page in enumerate(doc):
+            if i >= max_pages:
+                parts.append("…[页数超限已截断]…")
+                break
+            pix = page.get_pixmap(dpi=200)
+            buf = io.BytesIO(pix.tobytes("png"))
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            payload = json.dumps({"base64": b64, "options": options}).encode()
+            req = urllib.request.Request(
+                f"http://{UMI_HOST}:{UMI_PORT}/api/ocr",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = urllib.request.urlopen(req, timeout=180)
+            r = json.loads(resp.read().decode())
+            if r.get("code") == 100:
+                t = (r.get("data") or "").strip()
+                if t:
+                    parts.append(f"[第{i+1}页]\n{t}")
+            pages_done += 1
+    finally:
+        doc.close()
+    return "\n\n".join(parts), pages_done
+
+
 def extract_text(path: str, ext: str, logger: logging.Logger) -> tuple[str | None, str | None]:
     """返回 (正文, doc_type)。异常返回 (None, error)。"""
     try:
@@ -339,14 +547,19 @@ def extract_text(path: str, ext: str, logger: logging.Logger) -> tuple[str | Non
             import fitz  # PyMuPDF
             doc = fitz.open(path)
             parts = []
+            has_text_layer = False
             for i, page in enumerate(doc):
                 if i >= MAX_PDF_PAGES:
                     parts.append(TRUNC_MARK)
                     break
                 t = page.get_text("text").strip()
                 if t:
+                    has_text_layer = True
                     parts.append(t)
             doc.close()
+            if not parts and not has_text_layer:
+                # 纯扫描件（无文字层）→ 交给 OCR pass 处理
+                return None, "pdf-scan"
             return "\n".join(parts), "pdf"
 
         if kind == "epub":
@@ -626,6 +839,322 @@ def merge_media_descriptions(conn: sqlite3.Connection, media_db_path: str, logge
     return n
 
 
+def ocr_pass(root: str, db_path: str, logger: logging.Logger, only_pdf: bool = False) -> dict:
+    """Umi-OCR 识别 pass：给无正文的图片/扫描PDF 提取文字入库。
+
+    断点续传：已有 content_text 的自动跳过。单线程（Umi-OCR 后端并发差）。
+    返回 {"ok": n, "no_text": n, "failed": n, "skipped": n}
+    """
+    result = {"ok": 0, "no_text": 0, "failed": 0, "skipped": 0}
+    if not umi_ensure_running():
+        logger.warning("Umi-OCR 未运行且无法启动，OCR pass 跳过")
+        result["failed"] = -1
+        return result
+
+    options = umi_build_options()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    # 收集待识别文件：图片(库内无正文) + 扫描PDF
+    ext_ph = ",".join("?" * len(OCR_EXTS))
+    if only_pdf:
+        rows = conn.execute(
+            "SELECT file_path FROM files WHERE file_ext='.pdf' AND (content_text IS NULL OR content_text='')"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT file_path FROM files WHERE file_ext IN ({ext_ph}) AND (content_text IS NULL OR content_text='')",
+            tuple(sorted(OCR_EXTS)),
+        ).fetchall()
+        rows += conn.execute(
+            "SELECT file_path FROM files WHERE file_ext='.pdf' AND (content_text IS NULL OR content_text='')"
+        ).fetchall()
+    # 去重 + 检查文件仍存在
+    todo = []
+    seen = set()
+    for (p,) in rows:
+        if p in seen:
+            continue
+        seen.add(p)
+        if os.path.exists(p):
+            todo.append(p)
+    logger.info("OCR pass: %d 个待识别文件", len(todo))
+
+    for i, path in enumerate(todo, 1):
+        ext = os.path.splitext(path)[1].lower()
+        # 超大图片（产品原图/PSD照片）跳过 OCR：无文字价值且可能卡死
+        try:
+            if os.path.getsize(path) > OCR_MAX_FILE_MB * 1024 * 1024:
+                conn.execute(
+                    "UPDATE files SET content_text=?, content_preview=?, doc_type=?, error=NULL, indexed_at=? WHERE file_path=?",
+                    (OCR_NO_TEXT_MARK, OCR_NO_TEXT_MARK, "media-ocr-skip",
+                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path),
+                )
+                conn.commit()
+                result["no_text"] += 1
+                continue
+        except OSError:
+            pass
+        try:
+            if ext == ".pdf":
+                text, _ = umi_ocr_pdf(path, options)
+                doc_type = "pdf-ocr"
+            else:
+                text = umi_ocr_image(path, options)
+                doc_type = "media-ocr"
+        except Exception as e:
+            result["failed"] += 1
+            conn.execute(
+                "UPDATE files SET error=? WHERE file_path=?",
+                (f"ERR|OCR|{str(e)[:150]}", path),
+            )
+            conn.commit()
+            if result["failed"] <= 10:
+                logger.warning("OCR FAIL %s: %s", path, str(e)[:150])
+            continue
+
+        if text:
+            content = text
+            preview = text[:PREVIEW_CHARS]
+            result["ok"] += 1
+        else:
+            content = OCR_NO_TEXT_MARK
+            preview = OCR_NO_TEXT_MARK
+            doc_type = doc_type + "-notext"
+            result["no_text"] += 1
+        conn.execute(
+            "UPDATE files SET content_text=?, content_preview=?, doc_type=?, error=NULL, indexed_at=? WHERE file_path=?",
+            (content, preview, doc_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path),
+        )
+        conn.commit()
+        if i % 100 == 0 or i == len(todo):
+            logger.info("OCR pass 进度 %d/%d ok=%d 无文字=%d 失败=%d",
+                        i, len(todo), result["ok"], result["no_text"], result["failed"])
+
+    conn.close()
+    logger.info("OCR pass 完成: 识别=%d 无文字=%d 失败=%d 跳过=%d",
+                result["ok"], result["no_text"], result["failed"], result["skipped"])
+    return result
+
+
+def _video_duration(path: str) -> float | None:
+    """ffprobe 取视频时长(秒)。失败返回 None。"""
+    try:
+        r = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _extract_frames(path: str, interval: float, max_frames: int) -> tuple[list[str], float]:
+    """抽帧：每 interval 秒 1 帧到临时目录，帧缩小到 720p 级加速 OCR。
+    返回 (帧路径列表, 实际间隔)。
+    帧文件名 f_0001.jpg 序号 → 时间 = (seq-1) * actual_interval。
+    视频短于 interval（或抽不到帧）→ 返回空列表，调用方按"无文字"处理而非失败。"""
+    import tempfile
+    tmpdir = tempfile.mkdtemp(prefix="vgocr_")
+    pat = os.path.join(tmpdir, "f_%04d.jpg")
+    vf = f"fps=1/{interval},scale='min(1280,iw)':-2"
+    try:
+        r = subprocess.run(
+            [FFMPEG_BIN, "-v", "error", "-i", path, "-vf", vf,
+             "-q:v", "3", pat],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if r.returncode != 0:
+            return [], interval
+    except Exception:
+        return [], interval
+    frames = sorted(os.listdir(tmpdir))
+    if not frames:
+        # 视频太短抽不到帧 → 用最小间隔 0.5s 再试一次
+        for f in os.listdir(tmpdir):
+            try:
+                os.remove(os.path.join(tmpdir, f))
+            except OSError:
+                pass
+        try:
+            r = subprocess.run(
+                [FFMPEG_BIN, "-v", "error", "-i", path, "-vf",
+                 "fps=2,scale='min(1280,iw)':-2", "-q:v", "3", pat],
+                capture_output=True, text=True, timeout=120,
+            )
+            if r.returncode == 0:
+                frames = sorted(os.listdir(tmpdir))
+        except Exception:
+            pass
+        if not frames:
+            return [], 0.5
+        return [os.path.join(tmpdir, f) for f in frames], 0.5
+    if len(frames) > max_frames:
+        # 超长视频：拉大间隔重新抽，保证全覆盖且帧数封顶
+        new_interval = interval * (len(frames) / max_frames + 1)
+        for f in frames:
+            try:
+                os.remove(os.path.join(tmpdir, f))
+            except OSError:
+                pass
+        r = subprocess.run(
+            [FFMPEG_BIN, "-v", "error", "-i", path, "-vf",
+             f"fps=1/{new_interval},scale='min(1280,iw)':-2",
+             "-q:v", "3", pat],
+            capture_output=True, text=True, timeout=3600,
+        )
+        if r.returncode != 0:
+            return [], new_interval
+        frames = sorted(os.listdir(tmpdir))
+        return [os.path.join(tmpdir, f) for f in frames], new_interval
+    return [os.path.join(tmpdir, f) for f in frames], interval
+
+
+def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
+                   exclude_dirs: tuple[str, ...] = ()) -> dict:
+    """视频抽帧 OCR：每 2 秒 1 帧 → Umi-OCR 识别 → 去重带时间戳入库。
+
+    结果格式（content_text）:
+        [00:00-00:04] 海水养硬罗马混凝土越泡越坚固
+        [04:00-04:06] 古罗马人掌握了一种失传的超级水泥
+    相邻帧文本相同则合并时间段；无文字帧跳过。断点续传（doc_type=video-ocr 跳过）。
+    exclude_dirs: 排除的子目录（绝对路径前缀），其中视频不识别。
+    """
+    result = {"ok": 0, "no_text": 0, "failed": 0, "skipped": 0}
+    if not os.path.isfile(FFMPEG_BIN) or not os.path.isfile(FFPROBE_BIN):
+        logger.warning("ffmpeg/ffprobe 不可用，视频 OCR pass 跳过")
+        result["failed"] = -1
+        return result
+    if not umi_ensure_running():
+        logger.warning("Umi-OCR 未运行且无法启动，视频 OCR pass 跳过")
+        result["failed"] = -1
+        return result
+
+    options = umi_build_options()
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    ext_ph = ",".join("?" * len(VIDEO_EXTS))
+    rows = conn.execute(
+        f"SELECT file_path FROM files WHERE file_ext IN ({ext_ph}) "
+        "AND (content_text IS NULL OR content_text='' OR doc_type NOT IN ('video-ocr','video-ocr-notext'))",
+        tuple(sorted(VIDEO_EXTS)),
+    ).fetchall()
+    todo = [p for (p,) in rows if os.path.exists(p)]
+    if exclude_dirs:
+        n_before = len(todo)
+        todo = [p for p in todo
+                if not any(p.lower().startswith(d.lower()) for d in exclude_dirs)]
+        logger.info("视频 OCR pass: 排除 %d 个（%s），剩 %d 个",
+                    n_before - len(todo), "、".join(exclude_dirs), len(todo))
+    logger.info("视频 OCR pass: %d 个待识别视频", len(todo))
+
+    for i, path in enumerate(todo, 1):
+        try:
+            dur = _video_duration(path)
+            interval = VIDEO_FRAME_INTERVAL
+            frames, interval = _extract_frames(path, interval, VIDEO_OCR_MAX_FRAMES)
+            if not frames:
+                # 极短视频（<0.5s 抽不到任何帧）→ 无文字
+                content = ""
+            else:
+                # 逐帧 OCR + 相邻相同文本合并时间戳
+                segments = []  # (start_s, end_s, text)
+                cur_text, cur_start = None, None
+                for idx, fp in enumerate(frames):
+                    t = (idx) * interval
+                    try:
+                        text = umi_ocr_image(fp, options)
+                    except Exception:
+                        text = ""
+                    if text:
+                        if text == cur_text:
+                            pass  # 延续当前段
+                        else:
+                            if cur_text is not None:
+                                segments[-1] = (segments[-1][0], t - interval, cur_text)
+                            cur_text, cur_start = text, t
+                            segments.append((t, t + interval, text))
+                    else:
+                        if cur_text is not None:
+                            segments[-1] = (segments[-1][0], t, cur_text)
+                            cur_text = None
+                if cur_text is not None:
+                    segments[-1] = (segments[-1][0], dur or segments[-1][0] + interval, cur_text)
+
+                lines = []
+                for s, e, txt in segments:
+                    if txt:
+                        mm1, ss1 = int(s // 60), int(s % 60)
+                        mm2, ss2 = int(e // 60), int(e % 60)
+                        lines.append(f"[{mm1:02d}:{ss1:02d}-{mm2:02d}:{ss2:02d}] {txt}")
+                content = "\n".join(lines)
+        except Exception as e:
+            result["failed"] += 1
+            conn.execute(
+                "UPDATE files SET error=? WHERE file_path=?",
+                (f"ERR|VIDEO-OCR|{str(e)[:150]}", path),
+            )
+            conn.commit()
+            if result["failed"] <= 10:
+                logger.warning("视频 OCR FAIL %s: %s", path, str(e)[:150])
+            continue
+        finally:
+            # 清理临时帧目录
+            fp_dir = os.path.dirname(frames[0]) if frames else None
+            if fp_dir and fp_dir.startswith(os.environ.get("TEMP", "C:\\Users\\xxx13\\AppData\\Local\\Temp")):
+                import shutil
+                shutil.rmtree(fp_dir, ignore_errors=True)
+
+        if content.strip():
+            doc_type = "video-ocr"
+            preview = content[:PREVIEW_CHARS]
+            result["ok"] += 1
+        else:
+            content = OCR_NO_TEXT_MARK
+            preview = OCR_NO_TEXT_MARK
+            doc_type = "video-ocr-notext"
+            result["no_text"] += 1
+        conn.execute(
+            "UPDATE files SET content_text=?, content_preview=?, doc_type=?, error=NULL, indexed_at=? WHERE file_path=?",
+            (content, preview, doc_type, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path),
+        )
+        conn.commit()
+        if i % 20 == 0 or i == len(todo):
+            logger.info("视频 OCR 进度 %d/%d ok=%d 无文字=%d 失败=%d",
+                        i, len(todo), result["ok"], result["no_text"], result["failed"])
+
+    conn.close()
+    logger.info("视频 OCR 完成: 识别=%d 无文字=%d 失败=%d",
+                result["ok"], result["no_text"], result["failed"])
+    return result
+
+
+def prune_missing(root: str, db_path: str, logger: logging.Logger) -> int:
+    """删除库中已不存在于文件系统的记录（文件被删/移动）。返回清理条数。"""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=30000")
+    rows = conn.execute("SELECT id, file_path FROM files").fetchall()
+    gone = []
+    for fid, fp in rows:
+        if not os.path.exists(fp):
+            gone.append((fid, fp))
+    n = 0
+    for fid, fp in gone:
+        conn.execute("DELETE FROM files WHERE id=?", (fid,))
+        n += 1
+    conn.commit()
+    conn.close()
+    if n:
+        logger.info("清理已删除文件记录: %d 条", n)
+    return n
+
+
 def scan(root: str, db_path: str, workers: int, merge_media: str | None, logger: logging.Logger):
     main_conn = init_db(db_path)
     total = skipped = indexed = media = meta = errors = 0
@@ -710,6 +1239,16 @@ def main():
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--workers", type=int, default=MAX_WORKERS)
     ap.add_argument("--merge-media", default=None, help="既有媒体库路径，回填AI描述")
+    ap.add_argument("--ocr-media", action="store_true",
+                    help="扫描后用 Umi-OCR 识别无正文图片(断点续传,可重跑)")
+    ap.add_argument("--ocr-pdf", action="store_true",
+                    help="仅用 Umi-OCR 识别扫描件PDF(无文字层)")
+    ap.add_argument("--ocr-video", action="store_true",
+                    help="视频抽帧OCR:每2秒1帧→Umi-OCR→去重带时间戳入库(断点续传)")
+    ap.add_argument("--exclude-video-dir", action="append", default=[],
+                    help="视频OCR排除的目录(绝对路径,可多次)。例: --exclude-video-dir \"D:\\BaiduSyncdisk\\1 蓓蓓的文件\"")
+    ap.add_argument("--prune", action="store_true",
+                    help="清理库中已不存在于文件系统的记录(文件被删/移动)")
     ap.add_argument("--stats", action="store_true", help="只显示库状态")
     args = ap.parse_args()
 
@@ -721,7 +1260,23 @@ def main():
     logger = setup_logging(log_path)
     logger.info("开始索引 root=%s db=%s workers=%d", args.root, args.db, args.workers)
     t0 = datetime.now()
+    if args.prune:
+        n = prune_missing(args.root, args.db, logger)
+        logger.info("PRUNE 耗时 %s -> 清理 %d 条", datetime.now() - t0, n)
+        return
+    if args.ocr_pdf:
+        r = ocr_pass(args.root, args.db, logger, only_pdf=True)
+        logger.info("OCR-PDF 耗时 %s -> %s", datetime.now() - t0, r)
+        return
+    if args.ocr_video:
+        r = video_ocr_pass(args.root, args.db, logger,
+                           exclude_dirs=tuple(args.exclude_video_dir))
+        logger.info("视频OCR 耗时 %s -> %s", datetime.now() - t0, r)
+        return
     scan(args.root, args.db, args.workers, args.merge_media, logger)
+    if args.ocr_media:
+        r = ocr_pass(args.root, args.db, logger)
+        logger.info("OCR 耗时 %s -> %s", datetime.now() - t0, r)
     logger.info("耗时 %s", datetime.now() - t0)
 
 
