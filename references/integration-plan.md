@@ -36,7 +36,7 @@ D:\BaiduSyncdisk (165GB / 45,799 文件)
         │   └─ 噪音排除：node_modules/.git/.cache/.codex_* 等 AI 工作目录、
         │                字体(.ttf)/资源映射(.map)/二进制(.exe) 全部跳过
         ▼
-D:\zhipuai_test\file_index.db
+D:\@kaifa\gongzuo-data\file_index.db
         ├─ files 表（46K 行：路径/名称/大小/时间/预览/全文/类型/错误）
         └─ files_search 虚表（FTS5 trigram 倒排索引）
         ▼
@@ -72,7 +72,7 @@ D:\zhipuai_test\file_index.db
 
 ```bash
 # 首次/增量全量索引（后台跑）
-python doc_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\file_index.db"
+python doc_indexer.py --root "D:\BaiduSyncdisk" --db "D:\@kaifa\gongzuo-data\file_index.db"
 
 # 搜索（秒级）
 python file_search.py "电动轮椅"                    # 全文+文件名
