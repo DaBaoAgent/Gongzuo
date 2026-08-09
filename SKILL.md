@@ -19,8 +19,8 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 
 1. **全文件索引**（doc_indexer.py）— 所有非媒体文件的**正文全文**（txt/md/pdf/docx/xlsx/pptx/doc/xls/epub/xmind/代码/配置…），
    图片/视频/音频存元数据（文件名/路径可搜）。FTS5 **trigram** 分词器，中文 3 字子串精准命中，秒级。
-2. **媒体 AI 描述**（media_indexer.py，原功能）— 智谱 glm-4.6v-flash 视觉模型给图片/视频生成语义描述，
-   可搜"电动轮椅 户外 场景"这类内容语义。
+2. **Umi-OCR 图片/视频识别**（doc_indexer.py --ocr-media/--ocr-video）— 本地免费 OCR 提取图中文字
+   与视频抽帧字幕/画面文字，可搜图片上的字、视频里的台词。
 
 两者都进 SQLite FTS5，搜索入口统一为 `file_search.py`。
 
@@ -33,8 +33,8 @@ python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --db "D:\@kaifa\gongzuo-
 python scripts/doc_indexer.py --ocr-media
 # 仅扫描件PDF识别:
 python scripts/doc_indexer.py --ocr-pdf
-# 媒体描述回填（媒体库存在时）:
-python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\@kaifa\gongzuo-data\media_index.db"
+# 视频抽帧OCR（每2秒1帧→识别画面文字/字幕，--exclude-video-dir 可排除目录）:
+python scripts/doc_indexer.py --ocr-video
 ```
 
 - 噪音自动排除：node_modules / .git / .cache / .codex_* / 字体(.ttf) / 资源映射(.map) / 二进制(.exe) 等
@@ -62,25 +62,6 @@ python scripts/file_search.py --stats                      # 库状态
 
 **日常问答模式**：用户随口问资料/账号/文件类问题（如"我的QQ机器人账号有哪些"、"提成规则是啥"）时，
 直接用 file_search.py 查库秒回，不要重新扫描、不要问用户想找什么文件。答案给出文件路径+关键内容。
-
-## 模式3: 媒体 AI 描述索引（media_indexer.py）
-
-仅当需要图片/视频的**内容语义**搜索时使用（如"找电动轮椅的产品图"）：
-
-```bash
-# 阿里百炼 qwen3-vl-plus（默认，推荐：~0.002元/张，8并发≈150张/分）
-python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\media_index.db" --workers 8 --provider dashscope
-# 智谱 glm-4.6v-flash（免费但 QPS 极低 ~1.2个/分/并发）
-python scripts/media_indexer.py --root "D:\BaiduSyncdisk" --db "D:\zhipuai_test\media_index.db" --workers 3 --provider zhipu
-# 分批/试跑: --limit N --shuffle（随机取样）；断点续传: 重跑自动跳过 path+mtime 未变
-python scripts/enhance_segmentation.py --db "D:\zhipuai_test\media_index.db"
-python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media "D:\zhipuai_test\media_index.db"  # 回填到全文件库
-```
-
-- `--provider dashscope|zhipu`（默认 dashscope）、`--model` 自定义模型、`--limit N`/`--shuffle` 分批试跑
-- 依赖: `DASHSCOPE_API_KEY`（百炼）或 `GLM_API_KEY`（智谱），写在 `~/.hermes/.env` 或 `D:\@佳康顺矩阵\hermes\.env`
-- 脚本自动累计 token 消耗并在结束时打印（费用以百炼账单为准）
-- 已知坑: qwen3-vl 拒绝 <100px 小图（脚本自动放大兜底）；json 解析正则应写单反斜杠 `\{.*\}`（双反斜杠会永远解析失败，2026-08 已修复）
 
 ## 模式5: 每日自动增量索引（cron）
 
@@ -143,7 +124,6 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 - 搜索: jieba（本机已装）
 - 图片OCR: Umi-OCR exe(D:\@kaifa\Umi-OCR\,skill: umi-ocr), Pillow, pillow-heif(HEIC)
 - 视频OCR: ffmpeg/ffprobe (C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin)
-- 媒体AI: 百炼 DASHSCOPE_API_KEY 或智谱 GLM_API_KEY, Pillow, jieba, ffmpeg/ffprobe
 - 系统: antiword（git-bash 自带 /mingw64/bin）
 
 ## 已知坑
@@ -152,8 +132,6 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 - **FTS5 trigram 只认 ≥3 字符**：2字中文词自动走 LIKE，别惊讶命中方式不同
 - 超大文件(>100万字符)正文截断，超限部分搜不到
 - 老 .doc（WPS/加密/损坏）部分失败，error 标记 `PERMANENT|...` 不再重试
-- 原媒体库 D:\@kaifa\gongzuo-data\media_index.db 需重跑 media_indexer.py 重建
-- 模型ID/免费模型限速问题见 references/zhipuai-model-history.md
 - doc_indexer.py 的 log 写在库同目录 doc_indexer.log
 
 ## 当前已索引库
@@ -165,5 +143,4 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 ## 参考文档
 
 - `references/integration-plan.md` — 整合方案全文（开源对比/架构/覆盖矩阵/限制/后续增强）
-- `references/zhipuai-model-history.md` — 视觉模型变更历史
 - `references/retry-failed-files.md` — 媒体索引失败重试模式

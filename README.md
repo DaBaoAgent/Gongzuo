@@ -21,7 +21,7 @@
 
 </div>
 
-**Gongzuo（工作）** 是一个离线、隐私优先的本地文件全文搜索引擎。它索引硬盘上所有文档（PDF / Word / Excel / PPT / 文本 / 代码 / 思维导图…）的**正文内容**，用 SQLite FTS5 **trigram** 分词器实现中文 3 字子串精准命中，**4 万+ 文件全库查询仅需 1~40ms**。图片 / 视频按文件名、路径索引（可选接入 AI 视觉模型生成语义描述）。
+**Gongzuo（工作）** 是一个离线、隐私优先的本地文件全文搜索引擎。它索引硬盘上所有文档（PDF / Word / Excel / PPT / 文本 / 代码 / 思维导图…）的**正文内容**，用 SQLite FTS5 **trigram** 分词器实现中文 3 字子串精准命中，**4 万+ 文件全库查询仅需 1~40ms**。图片 / 视频按文件名、路径索引，并用 Umi-OCR 本地识别图中文字与视频画面文字，找图/找视频秒回。
 
 > 它是 Everything（只搜文件名）、Recoll / DocFetcher（重 GUI、中文分词难配）、AnyTXT（闭源）之外，一个**开源、可脚本化、中文精准**的替代品。
 
@@ -71,7 +71,7 @@ python scripts/file_search.py --stats                       # 索引状态
 | 电子书 | epub（章节全文） |
 | 邮件 | eml |
 | 压缩包 | zip / 7z / rar（包内文件清单） |
-| 媒体 | 图片/视频/音频按文件名+路径索引（可选 AI 视觉语义描述） |
+| 媒体 | 图片/视频/音频按文件名+路径索引；图片/视频文字用 Umi-OCR 本地识别入库 |
 
 ## 🏗️ 架构
 
@@ -110,8 +110,7 @@ SQLite (file_index.db)
 
 - **Agent 问答**：`--json` 输出可直接接入 LLM Agent，实现"问一句秒回文件在哪"
 - **定时增量**：`schtasks` / cron 每周自动重跑，保持索引最新
-- **OCR 扩展点**：扫描型 PDF 可接 PaddleOCR 识别后入库
-- **AI 视觉描述**：`media_indexer.py` 用智谱 glm-4.6v-flash 免费模型给图片/视频生成语义描述，`--merge-media` 一键回填
+- **OCR 扩展点**：扫描型 PDF 可接 Umi-OCR / PaddleOCR 识别后入库（`--ocr-media` / `--ocr-video`）
 
 ## 📜 License
 
