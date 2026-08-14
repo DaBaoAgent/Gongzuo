@@ -1,7 +1,7 @@
 ---
 name: gongzuo
 version: "2.0"
-description: 文件智能索引与秒级检索。全文件正文全文搜(FTS5 trigram)+图片视频AI视觉描述，SQLite本地库。
+description: 文件智能索引与秒级检索。全文件正文全文搜(FTS5 trigram)+Umi-OCR图片视频文字识别，SQLite本地库。
 author: Dabao
 trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件、文档、图片、视频，或要从已索引库中秒级检索内容
 ---
@@ -9,7 +9,7 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 # 文件智能索引与秒级检索 (gongzuo)
 
 > **🔄 合并说明（2026-08-09）**：本技能为"本地文件/媒体索引检索"唯一伞形入口，已吸收两个重叠技能：
-> - `media-indexer` → 其视觉媒体索引能力本文"模式3"已完整覆盖；新增 `references/indexer-patterns.md`（视觉API调用/JSON解析/多线程坑的工程模式）
+> - `media-indexer` → 其媒体索引能力由 Umi-OCR 本地识别（`--ocr-media`/`--ocr-video`）取代；原付费视觉描述功能已移除
 > - `local-file-index` → 其工程模式（FTS5 trigram/提取兜底链/增量）本文已完整覆盖；新增 `references/doc-extraction-fallbacks.md`（各格式提取失败签名与正解）
 > - 检索前先 `file_search.py --stats` 确认库存在（历史教训：库目录被清理后 watchdog 全失效）。
 
@@ -65,11 +65,11 @@ python scripts/file_search.py --stats                      # 库状态
 
 ## 模式5: 每日自动增量索引（cron）
 
-已配置 Hermes cron 任务 `gongzuo每日增量索引`（job_id 9ef880df69ed）：
-每天 **04:00** 自动跑 `doc_indexer.py --root D:\BaiduSyncdisk` 增量刷新。
+推荐配置每日 **04:00** cron 自动跑 `doc_indexer.py --root D:\BaiduSyncdisk` 增量刷新（断点续传，重跑即增量）。
 
-- watchdog 脚本：`C:\Users\xxx13\AppData\Local\hermes\scripts\gongzuo_daily_index.py`
-- 行为：有新增/变更 → 输出摘要；有失败 → 警报；无变化 → 静默
+- watchdog 脚本：`gongzuo_daily_index.py`（放 Hermes scripts 目录）
+- 可选汇编：`gongzuo_assembly.py` 把新增数据整合进数据看板 md（增量快照 `.gongzuo_assembly_state.json`，--init 首次部署标记现有文件）
+- 行为：有新增/变更 → 输出摘要（含汇编结果）；有失败 → 警报；无变化 → 静默
 - 查看运行记录：`cronjob(action='list')`；改投递目标用 `cronjob(action='update', deliver='telegram')`
 
 ## 模式4: 状态查询
@@ -100,7 +100,7 @@ trigram 按 3 字子串建倒排索引：`MATCH '"电动轮椅"'` 精准命中�
 | epub/xmind/odt | zip 解包抽文本/标题 | — |
 | 图片 jpg/png/bmp/webp/tif | 元数据 only | `--ocr-media` 用 Umi-OCR 提取图中文字 |
 | 图片 heic/heif/psd | 元数据 only | Pillow(pillow-heif) 转 PNG 后 Umi-OCR |
-| 视频/音频 | 元数据 only | 描述靠 --merge-media 回填 |
+| 视频/音频 | 元数据 only | `--ocr-video` 抽帧 Umi-OCR 识别画面文字/字幕 |
 
 ### Umi-OCR 图片识别集成（模式1.5）
 
@@ -116,14 +116,38 @@ trigram 按 3 字子串建倒排索引：`MATCH '"电动轮椅"'` 精准命中�
 - 坑：伪装 HEIC（扩展名 .jpg 但内容 ftyp 魔数）→ `_image_to_b64` 已做 ftyp 嗅探自动转换，Umi-OCR 报 code=301 imdecode failed 时先查这个
 - 坑：超大图(>30MB)直接送 OCR 会卡死 → 已自动跳过；手机原图缩 720p 提速（详见 umi-ocr 技能 Pitfalls）
 
+### Qwen3-VL 场景描述集成（模式1.6，2026-08-14 上线）
+
+本地视觉模型给图片补"画面里是什么"——Umi-OCR 只出文字，Qwen3-VL 出主体/颜色/场景描述，进 FTS 可搜（如"红色电动轮椅"、"摄影棚"、"展厅"）：
+
+```bash
+# 缺口模式(默认): 只处理无文字/未处理/超大跳过图片(~678张,断点续传)
+python scripts/doc_indexer.py --vision-desc
+# 全部图片(6382张 ≈ 46小时,慎用;建议拆夜跑或先跑缺口)
+python scripts/doc_indexer.py --vision-desc-all
+# 限量测试
+python scripts/doc_indexer.py --vision-desc --vision-limit 3
+# 视频场景描述(缺口模式): 片头1帧(2s)+片尾1帧(尾-2s)→Qwen3-VL→[mm:ss]入库, ~24s/条
+python scripts/doc_indexer.py --vision-video [--vision-limit N]
+```
+
+- 写入：content_text 追加 `【画面】 描述`（原 OCR 文字保留），doc_type=`media-vision`(缺口)/`media-vision-full`(全量)，断点续传（doc_type 以 vision 开头跳过）
+- 前置：本地 llama-server 跑在 127.0.0.1:1234（模型与启动方式见 llama-cpp 技能），未启动会直接报错提示命令
+- 速度：720px 缩图 + 80 tokens ≈ **26s/张**（20-35s 区间）→ 缺口 678 张 ≈ 5 小时（通宵档）；全量 6382 张 ≈ 46 小时
+- 分辨率基准（2026-08-14 实测单图 1024x1536）：原图不压缩 136s（慢4-5倍无收益）；**720px≈32s 细节最稳**（型号/配色/小字）；600px≈35s 有轻微歧义（手动→电动）；**500px≈24s 主体级下限**（五大模块/主体/场景全对，配色小偏差）。索引用途 720px 为默认甜点
+- 服务器被杀后不会自愈：`--vision-desc` 报"视觉服务器未启动"时，手动重启 llama-server 即可
+- 坑（2026-08-14 实测修复）：①HEIC 必须先 `register_heif_opener()` 否则 cannot identify（已写进 vision_describe_image）②.gif 不在 OCR_EXTS 会漏（已加入 PIL_CONVERT_EXTS）③视觉上限 60MB（>60MB 长图跳过）④服务器冷启动约 15s，索引器会等 60s（_vision_up wait=True）
+- 模型：Qwen3-VL-8B Q4_K_M + mmproj（unsloth 文本 + 官方投影器配对），细节见 llama-cpp 技能
+
 ### jieba 分词（搜索端）
 file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期开销。
 
 ### 依赖
 - 全文件索引: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile
 - 搜索: jieba（本机已装）
-- 图片OCR: Umi-OCR exe(D:\@kaifa\Umi-OCR\,skill: umi-ocr), Pillow, pillow-heif(HEIC)
-- 视频OCR: ffmpeg/ffprobe (C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin)
+- 图片OCR: Umi-OCR(本地安装), Pillow, pillow-heif(HEIC)
+- 图片场景描述: Qwen3-VL-8B llama-server(127.0.0.1:1234,本地模型)
+- 视频OCR: ffmpeg/ffprobe（需加入 PATH）
 - 系统: antiword（git-bash 自带 /mingw64/bin）
 
 ## 已知坑
@@ -133,12 +157,13 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 - 超大文件(>100万字符)正文截断，超限部分搜不到
 - 老 .doc（WPS/加密/损坏）部分失败，error 标记 `PERMANENT|...` 不再重试
 - doc_indexer.py 的 log 写在库同目录 doc_indexer.log
+- **弹窗坑**：pythonw 下 spawn 控制台程序（ffmpeg/ffprobe/7z/antiword）必须带 `creationflags=0x08000000`（CREATE_NO_WINDOW），否则每抽一帧弹一个黑窗（2026-08-14 实测：视频 vision 任务每 43s 闪一次窗）
 
 ## 当前已索引库
 
 | 库 | 内容 | 状态 |
 |----|------|------|
-| D:\@kaifa\gongzuo-data\file_index.db | 全文件正文+媒体元数据+图片OCR文字 | 12,076 文件；图片 OCR 全量完成 2026-08-09：6,344 识别 + 846 无文字 + 30 超大跳过 + 16 扫描PDF，0 失败 |
+| D:\@kaifa\gongzuo-data\file_index.db | 全文件正文+媒体元数据+图片OCR文字 | 2026-08-14 实测 5,609 文件（文档 679 + 媒体 4,930），失败 0，库 131 MB（清理后计数） |
 
 ## 参考文档
 

@@ -107,13 +107,22 @@ UMI_LANG_HINTS = {
 # Umi-OCR 直接支持的图片扩展名
 UMI_IMG_EXTS = {".jpg", ".jpe", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 # 可用 Pillow 转 PNG 后交给 Umi-OCR 的扩展名（HEIC/PSD 等）
-PIL_CONVERT_EXTS = {".heic", ".heif", ".psd"}
+PIL_CONVERT_EXTS = {".heic", ".heif", ".psd", ".gif"}
 OCR_EXTS = UMI_IMG_EXTS | PIL_CONVERT_EXTS
 OCR_PDF_PAGES = 30          # 扫描件 PDF 最多 OCR 页数
 OCR_MAX_IMG_SIDE = 2880     # 超过此边长先等比缩小（Umi-OCR 提速）
 OCR_HEIC_MAX_SIDE = 1280    # HEIC 手机原图缩到 720p 级再识别（上传体积-90%，提速5倍+）
 OCR_MAX_FILE_MB = 30        # 超过此大小的图片跳过 OCR（产品原图/PSD 照片，避免卡死）
 OCR_NO_TEXT_MARK = "【无文字图片】"
+# ── Qwen3-VL 本地视觉描述集成 ─────────────────────────────────────────
+# Umi-OCR 只出文字；Qwen3-VL 补"画面里是什么"（主体/颜色/场景）→ 可搜"红色电动轮椅"
+VISION_HOST = "127.0.0.1"
+VISION_PORT = 1234
+VISION_MAX_SIDE = 720        # 缩到 720px 提速（~17s/张 vs 原图 ~110s）
+VISION_MAX_FILE_MB = 60      # 超大图跳过（视觉会缩到720px,上限放宽到60MB）
+VISION_PROMPT = "用一句中文描述这张图片：主体是什么、什么颜色、什么场景。"
+VISION_MARK = "【画面】"
+VISION_TIMEOUT = 300
 # ── 视频抽帧 OCR ───────────────────────────────────────────────────────
 FFMPEG_BIN = r"C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin\ffmpeg.exe"
 FFPROBE_BIN = r"C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin\ffprobe.exe"
@@ -649,7 +658,8 @@ def extract_text(path: str, ext: str, logger: logging.Logger) -> tuple[str | Non
         if ext in (".7z", ".rar"):
             try:
                 r = subprocess.run(
-                    ["7z", "l", "-ba", path], capture_output=True, timeout=SUBPROCESS_TIMEOUT
+                    ["7z", "l", "-ba", path], capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
                 )
                 if r.returncode == 0:
                     return "存档内容: " + r.stdout.decode("utf-8", errors="ignore"), ext
@@ -686,6 +696,7 @@ def extract_doc(path: str, logger: logging.Logger) -> str:
         r = subprocess.run(
             ["antiword", "-m", "UTF-8.txt", path],
             capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
         )
         if r.returncode == 0:
             return r.stdout.decode("utf-8", errors="ignore")
@@ -945,6 +956,7 @@ def _video_duration(path: str) -> float | None:
             [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, timeout=30,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
         )
         if r.returncode == 0 and r.stdout.strip():
             return float(r.stdout.strip())
@@ -967,6 +979,7 @@ def _extract_frames(path: str, interval: float, max_frames: int) -> tuple[list[s
             [FFMPEG_BIN, "-v", "error", "-i", path, "-vf", vf,
              "-q:v", "3", pat],
             capture_output=True, text=True, timeout=3600,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
         )
         if r.returncode != 0:
             return [], interval
@@ -985,6 +998,7 @@ def _extract_frames(path: str, interval: float, max_frames: int) -> tuple[list[s
                 [FFMPEG_BIN, "-v", "error", "-i", path, "-vf",
                  "fps=2,scale='min(1280,iw)':-2", "-q:v", "3", pat],
                 capture_output=True, text=True, timeout=120,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
             )
             if r.returncode == 0:
                 frames = sorted(os.listdir(tmpdir))
@@ -1006,6 +1020,7 @@ def _extract_frames(path: str, interval: float, max_frames: int) -> tuple[list[s
              f"fps=1/{new_interval},scale='min(1280,iw)':-2",
              "-q:v", "3", pat],
             capture_output=True, text=True, timeout=3600,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
         )
         if r.returncode != 0:
             return [], new_interval
@@ -1233,6 +1248,208 @@ def stats(db_path: str):
     conn.close()
 
 
+def vision_desc_pass(root: str, db_path: str, logger: logging.Logger,
+                     all_images: bool = False, limit: int = 0) -> dict:
+    """Qwen3-VL 场景描述 pass：给图片补"画面里是什么"。
+
+    默认缺口模式：只处理 Umi-OCR 无文字/未处理/超大跳过的图片；
+    all_images=True 处理全部图片。
+    断点续传：doc_type 以 vision 开头即跳过（可反复重跑）。
+    """
+    if not _vision_up(wait=True):
+        raise SystemExit(
+            "视觉服务器未启动: 先跑 Startup\\Hermes_VisionServer.cmd 或 "
+            "llama-server -m D:\\@kaifa\\models\\Qwen3-VL-8B-Instruct-Q4_K_M.gguf "
+            "--mmproj D:\\@kaifa\\models\\mmproj-Qwen3VL-8B-Instruct-F16.gguf "
+            "--host 127.0.0.1 --port 1234 -c 4096 -t 4 -ngl 0")
+    conn = init_db(db_path)
+    ph = ",".join("?" * len(OCR_EXTS))
+    if all_images:
+        rows = conn.execute(
+            f"SELECT file_path FROM files WHERE is_media=1 AND file_ext IN ({ph}) "
+            "AND (doc_type IS NULL OR doc_type NOT LIKE 'vision%')",
+            tuple(sorted(OCR_EXTS))).fetchall()
+    else:
+        rows = conn.execute(
+            f"SELECT file_path FROM files WHERE is_media=1 AND file_ext IN ({ph}) "
+            "AND (content_text IS NULL OR content_text='' OR content_text=? OR doc_type LIKE '%skip%') "
+            "AND (doc_type IS NULL OR doc_type NOT LIKE 'vision%')",
+            tuple(sorted(OCR_EXTS)) + (OCR_NO_TEXT_MARK,)).fetchall()
+    todo = [p for (p,) in rows if os.path.exists(p)]
+    if limit:
+        todo = todo[:limit]
+    logger.info("VISION pass: %d 个待描述文件 (%s)", len(todo),
+                "全部" if all_images else "缺口:无文字/未处理/超大跳过")
+    result = {"ok": 0, "failed": 0, "skipped_big": 0}
+    t_start = time.time()
+    for i, path in enumerate(todo, 1):
+        try:
+            if os.path.getsize(path) > VISION_MAX_FILE_MB * 1024 * 1024:
+                result["skipped_big"] += 1
+                continue
+            desc = vision_describe_image(path)
+        except Exception as e:
+            result["failed"] += 1
+            conn.execute("UPDATE files SET error=? WHERE file_path=?",
+                         (f"ERR|VISION|{str(e)[:150]}", path))
+            conn.commit()
+            if result["failed"] <= 10:
+                logger.warning("VISION FAIL %s: %s", path, str(e)[:150])
+            continue
+        row = conn.execute("SELECT content_text, doc_type FROM files WHERE file_path=?", (path,)).fetchone()
+        old_text = (row[0] or "") if row else ""
+        content = (f"{VISION_MARK} {desc}"
+                   if not old_text or old_text == OCR_NO_TEXT_MARK
+                   else f"{old_text}\n{VISION_MARK} {desc}")
+        doc_type = "media-vision-full" if all_images else "media-vision"
+        conn.execute(
+            "UPDATE files SET content_text=?, content_preview=?, doc_type=?, error=NULL, indexed_at=? WHERE file_path=?",
+            (content, content[:PREVIEW_CHARS], doc_type,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path))
+        conn.commit()
+        result["ok"] += 1
+        if i % 10 == 0:
+            logger.info("VISION %d/%d avg=%.1fs/张", i, len(todo), (time.time() - t_start) / i)
+    conn.close()
+    return result
+
+
+def _vision_up(wait: bool = False) -> bool:
+    """检查视觉服务器是否就绪。wait=True 时轮询等待最多 60s（服务器冷启动约 15s）。"""
+    deadline = time.time() + (60 if wait else 3)
+    while True:
+        try:
+            with urllib.request.urlopen(
+                    f"http://{VISION_HOST}:{VISION_PORT}/v1/models", timeout=3) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(3)
+
+
+def vision_describe_image(path: str, max_tokens: int = 80) -> str:
+    """Qwen3-VL 本地描述一张图片（720px，返回一句中文描述）。"""
+    from PIL import Image
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()  # HEIC 必须注册，否则 cannot identify image file
+    except ImportError:
+        pass
+    im = Image.open(path)
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    im.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    body = json.dumps({
+        "model": "qwen3-vl",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "text", "text": VISION_PROMPT},
+        ]}],
+        "max_tokens": max_tokens, "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(
+        f"http://{VISION_HOST}:{VISION_PORT}/v1/chat/completions",
+        data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=VISION_TIMEOUT) as r:
+        out = json.loads(r.read())["choices"][0]["message"]["content"]
+    return out.strip()
+
+
+def video_vision_pass(root: str, db_path: str, logger: logging.Logger,
+                      limit: int = 0) -> dict:
+    """视频场景描述 pass：片头 2 帧(2s/4s) + 片尾 2 帧(尾-4s/尾-2s) → Qwen3-VL → 带时间戳入库。
+
+    断点续传：doc_type 以 video-vision 开头即跳过；失败标 ERR|VISIONVID 下次重试。
+    """
+    if not _vision_up(wait=True):
+        raise SystemExit(
+            "视觉服务器未启动: 先跑 Startup\\Hermes_VisionServer.cmd 或 "
+            "llama-server -m D:\\@kaifa\\models\\Qwen3-VL-8B-Instruct-Q4_K_M.gguf "
+            "--mmproj D:\\@kaifa\\models\\mmproj-Qwen3VL-8B-Instruct-F16.gguf "
+            "--host 127.0.0.1 --port 1234 -c 4096 -t 4 -ngl 0")
+    conn = init_db(db_path)
+    ext_ph = ",".join("?" * len(VIDEO_EXTS))
+    rows = conn.execute(
+        f"SELECT file_path FROM files WHERE is_media=1 AND file_ext IN ({ext_ph}) "
+        "AND (doc_type IS NULL OR doc_type NOT LIKE 'video-vision%')",
+        tuple(sorted(VIDEO_EXTS))).fetchall()
+    todo = [p for (p,) in rows if os.path.exists(p)]
+    if limit:
+        todo = todo[:limit]
+    logger.info("VISION-VIDEO pass: %d 个待识别视频 (片头2帧+片尾2帧)", len(todo))
+    result = {"ok": 0, "failed": 0, "frames": 0}
+    t_start = time.time()
+    tmp_root = os.environ.get("TEMP", r"C:\Users\xxx13\AppData\Local\Temp")
+    for i, path in enumerate(todo, 1):
+        frames = []
+        try:
+            # 1. 时长（ffprobe）
+            dur_s = subprocess.run(
+                [FFPROBE_BIN, "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=60,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
+            ).stdout.strip()
+            dur = float(dur_s or 0)
+            # 2. 片头 1 帧(2s) + 片尾 1 帧(尾-2s)，夹紧去重
+            ts_list = sorted({round(max(0.0, min(t, max(0.0, dur - 0.5))), 1)
+                              for t in (2.0, dur - 2.0)})
+            # 3. 抽帧
+            import tempfile
+            fp_dir = tempfile.mkdtemp(prefix="gzv_", dir=tmp_root)
+            for j, ts in enumerate(ts_list):
+                out = os.path.join(fp_dir, f"f{j}.jpg")
+                subprocess.run([FFMPEG_BIN, "-y", "-v", "error", "-ss", str(ts),
+                                "-i", path, "-frames:v", "1", "-q:v", "3", out],
+                               timeout=120, check=True,
+                               creationflags=0x08000000)  # CREATE_NO_WINDOW 防弹窗
+                frames.append((ts, out))
+            # 4. 逐帧识别
+            lines = []
+            for ts, fpath in frames:
+                desc = vision_describe_image(fpath)
+                mm, ss = int(ts // 60), int(ts % 60)
+                lines.append(f"[{mm:02d}:{ss:02d}] {VISION_MARK} {desc}")
+                result["frames"] += 1
+            content_new = "\n".join(lines)
+            row = conn.execute("SELECT content_text FROM files WHERE file_path=?", (path,)).fetchone()
+            old_text = (row[0] or "") if row else ""
+            # 幂等：剔除旧【画面】行再追加（重跑不重复叠加）
+            kept = "\n".join(l for l in old_text.splitlines() if VISION_MARK not in l).strip()
+            content = (content_new if not kept
+                       else f"{kept}\n{content_new}")
+            conn.execute(
+                "UPDATE files SET content_text=?, content_preview=?, doc_type=?, error=NULL, indexed_at=? WHERE file_path=?",
+                (content, content[:PREVIEW_CHARS], "video-vision",
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"), path))
+            conn.commit()
+            result["ok"] += 1
+        except Exception as e:
+            result["failed"] += 1
+            conn.execute("UPDATE files SET error=? WHERE file_path=?",
+                         (f"ERR|VISIONVID|{str(e)[:150]}", path))
+            conn.commit()
+            if result["failed"] <= 10:
+                logger.warning("视频VISION FAIL %s: %s", path, str(e)[:150])
+        finally:
+            if frames:
+                fp_dir = os.path.dirname(frames[0][1])
+                if fp_dir and fp_dir.startswith(tmp_root):
+                    import shutil
+                    shutil.rmtree(fp_dir, ignore_errors=True)
+        if i % 5 == 0:
+            logger.info("VISION-VIDEO %d/%d avg=%.1fs/条", i, len(todo),
+                        (time.time() - t_start) / i)
+    conn.close()
+    return result
+
+
 def main():
     ap = argparse.ArgumentParser(description="gongzuo 全文件索引器")
     ap.add_argument("--root", default=DEFAULT_ROOT)
@@ -1245,6 +1462,14 @@ def main():
                     help="仅用 Umi-OCR 识别扫描件PDF(无文字层)")
     ap.add_argument("--ocr-video", action="store_true",
                     help="视频抽帧OCR:每2秒1帧→Umi-OCR→去重带时间戳入库(断点续传)")
+    ap.add_argument("--vision-desc", action="store_true",
+                    help="Qwen3-VL 场景描述: 补齐无文字/未处理/超大跳过图片(断点续传)")
+    ap.add_argument("--vision-desc-all", action="store_true",
+                    help="Qwen3-VL 场景描述: 全部图片")
+    ap.add_argument("--vision-video", action="store_true",
+                    help="视频场景描述: 片头片尾各2帧→Qwen3-VL→带时间戳入库(断点续传)")
+    ap.add_argument("--vision-limit", type=int, default=0,
+                    help="VISION 限量处理(测试用)")
     ap.add_argument("--exclude-video-dir", action="append", default=[],
                     help="视频OCR排除的目录(绝对路径,可多次)。例: --exclude-video-dir \"D:\\BaiduSyncdisk\\1 蓓蓓的文件\"")
     ap.add_argument("--prune", action="store_true",
@@ -1272,6 +1497,15 @@ def main():
         r = video_ocr_pass(args.root, args.db, logger,
                            exclude_dirs=tuple(args.exclude_video_dir))
         logger.info("视频OCR 耗时 %s -> %s", datetime.now() - t0, r)
+        return
+    if args.vision_desc or args.vision_desc_all:
+        r = vision_desc_pass(args.root, args.db, logger,
+                             all_images=args.vision_desc_all, limit=args.vision_limit)
+        logger.info("VISION 耗时 %s -> %s", datetime.now() - t0, r)
+        return
+    if args.vision_video:
+        r = video_vision_pass(args.root, args.db, logger, limit=args.vision_limit)
+        logger.info("视频VISION 耗时 %s -> %s", datetime.now() - t0, r)
         return
     scan(args.root, args.db, args.workers, args.merge_media, logger)
     if args.ocr_media:
