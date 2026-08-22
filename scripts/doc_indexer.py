@@ -1029,6 +1029,41 @@ def _extract_frames(path: str, interval: float, max_frames: int) -> tuple[list[s
     return [os.path.join(tmpdir, f) for f in frames], interval
 
 
+def _extract_head_tail_frames(path: str, dur: float | None, n_head: int = 1, n_tail: int = 1) -> list[tuple[float, str]]:
+    """只抽片头/片尾各 n 帧（默认各 1 帧：2s 处 + 尾-2s 处）→ 返回 [(时间戳, 帧路径)]。
+
+    视频 OCR/描述用：用户要求轻量抽帧，不逐 2 秒扫全片。
+    dur 为 None 或抽帧失败 → 空列表。
+    """
+    if not dur or dur <= 0:
+        return []
+    import tempfile
+    ts_list = []
+    head_ts = [2.0 + i * 1.0 for i in range(n_head)]
+    tail_ts = [dur - 2.0 - i * 1.0 for i in range(n_tail)]
+    for t in head_ts + tail_ts:
+        t = round(max(0.5, min(t, max(0.5, dur - 0.5))), 1)
+        ts_list.append(t)
+    ts_list = sorted(set(ts_list))  # 去重排序
+    tmpdir = tempfile.mkdtemp(prefix="vghead_")
+    frames = []
+    for j, ts in enumerate(ts_list):
+        out = os.path.join(tmpdir, f"f{j}.jpg")
+        try:
+            r = subprocess.run(
+                [FFMPEG_BIN, "-y", "-v", "error", "-ss", str(ts),
+                 "-i", path, "-frames:v", "1", "-q:v", "3",
+                 "-vf", "scale='min(1280,iw)':-2", out],
+                capture_output=True, text=True, timeout=120,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
+            )
+            if r.returncode == 0 and os.path.isfile(out):
+                frames.append((ts, out))
+        except Exception:
+            continue
+    return frames
+
+
 def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
                    exclude_dirs: tuple[str, ...] = ()) -> dict:
     """视频抽帧 OCR：每 2 秒 1 帧 → Umi-OCR 识别 → 去重带时间戳入库。
@@ -1072,42 +1107,21 @@ def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
     for i, path in enumerate(todo, 1):
         try:
             dur = _video_duration(path)
-            interval = VIDEO_FRAME_INTERVAL
-            frames, interval = _extract_frames(path, interval, VIDEO_OCR_MAX_FRAMES)
+            frames = _extract_head_tail_frames(path, dur, n_head=1, n_tail=1)
             if not frames:
-                # 极短视频（<0.5s 抽不到任何帧）→ 无文字
+                # 抽不到帧（极短/损坏）→ 无文字
                 content = ""
             else:
-                # 逐帧 OCR + 相邻相同文本合并时间戳
-                segments = []  # (start_s, end_s, text)
-                cur_text, cur_start = None, None
-                for idx, fp in enumerate(frames):
-                    t = (idx) * interval
+                # 逐帧 OCR（头尾各 1 帧，无相邻合并需求）
+                lines = []
+                for ts, fp in frames:
                     try:
                         text = umi_ocr_image(fp, options)
                     except Exception:
                         text = ""
                     if text:
-                        if text == cur_text:
-                            pass  # 延续当前段
-                        else:
-                            if cur_text is not None:
-                                segments[-1] = (segments[-1][0], t - interval, cur_text)
-                            cur_text, cur_start = text, t
-                            segments.append((t, t + interval, text))
-                    else:
-                        if cur_text is not None:
-                            segments[-1] = (segments[-1][0], t, cur_text)
-                            cur_text = None
-                if cur_text is not None:
-                    segments[-1] = (segments[-1][0], dur or segments[-1][0] + interval, cur_text)
-
-                lines = []
-                for s, e, txt in segments:
-                    if txt:
-                        mm1, ss1 = int(s // 60), int(s % 60)
-                        mm2, ss2 = int(e // 60), int(e % 60)
-                        lines.append(f"[{mm1:02d}:{ss1:02d}-{mm2:02d}:{ss2:02d}] {txt}")
+                        mm, ss = int(ts // 60), int(ts % 60)
+                        lines.append(f"[{mm:02d}:{ss:02d}] {text}")
                 content = "\n".join(lines)
         except Exception as e:
             result["failed"] += 1
@@ -1120,8 +1134,11 @@ def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
                 logger.warning("视频 OCR FAIL %s: %s", path, str(e)[:150])
             continue
         finally:
-            # 清理临时帧目录
-            fp_dir = os.path.dirname(frames[0]) if frames else None
+            # 清理临时帧目录（frames 元素为 (ts, path) 元组）
+            fp_dir = None
+            if frames:
+                fp = frames[0][1] if isinstance(frames[0], tuple) else frames[0]
+                fp_dir = os.path.dirname(fp)
             if fp_dir and fp_dir.startswith(os.environ.get("TEMP", "C:\\Users\\xxx13\\AppData\\Local\\Temp")):
                 import shutil
                 shutil.rmtree(fp_dir, ignore_errors=True)
@@ -1249,14 +1266,19 @@ def stats(db_path: str):
 
 
 def vision_desc_pass(root: str, db_path: str, logger: logging.Logger,
-                     all_images: bool = False, limit: int = 0) -> dict:
-    """Qwen3-VL 场景描述 pass：给图片补"画面里是什么"。
+                     all_images: bool = False, limit: int = 0,
+                     provider: str = "local") -> dict:
+    """场景描述 pass：给图片补"画面里是什么"。
 
+    provider: "local"=Qwen3-VL(127.0.0.1:1234) / "zhipu"=智谱glm-4v-flash(免费云端)。
     默认缺口模式：只处理 Umi-OCR 无文字/未处理/超大跳过的图片；
     all_images=True 处理全部图片。
     断点续传：doc_type 以 vision 开头即跳过（可反复重跑）。
     """
-    if not _vision_up(wait=True):
+    if provider == "zhipu":
+        if not (os.environ.get("ZHIPU_API_KEY") or os.environ.get("ZHIPUAI_API_KEY")):
+            raise SystemExit("未设置 ZHIPU_API_KEY: 智谱 open.bigmodel.cn 免费 glm-4v-flash")
+    elif not _vision_up(wait=True):
         raise SystemExit(
             "视觉服务器未启动: 先跑 Startup\\Hermes_VisionServer.cmd 或 "
             "llama-server -m D:\\@kaifa\\models\\Qwen3-VL-8B-Instruct-Q4_K_M.gguf "
@@ -1287,7 +1309,10 @@ def vision_desc_pass(root: str, db_path: str, logger: logging.Logger,
             if os.path.getsize(path) > VISION_MAX_FILE_MB * 1024 * 1024:
                 result["skipped_big"] += 1
                 continue
-            desc = vision_describe_image(path)
+            if provider == "zhipu":
+                desc = zhipu_describe_image(path)
+            else:
+                desc = vision_describe_image(path)
         except Exception as e:
             result["failed"] += 1
             conn.execute("UPDATE files SET error=? WHERE file_path=?",
@@ -1301,7 +1326,8 @@ def vision_desc_pass(root: str, db_path: str, logger: logging.Logger,
         content = (f"{VISION_MARK} {desc}"
                    if not old_text or old_text == OCR_NO_TEXT_MARK
                    else f"{old_text}\n{VISION_MARK} {desc}")
-        doc_type = "media-vision-full" if all_images else "media-vision"
+        doc_type = "media-vision-zhipu" if provider == "zhipu" else (
+            "media-vision-full" if all_images else "media-vision")
         conn.execute(
             "UPDATE files SET content_text=?, content_preview=?, doc_type=?, error=NULL, indexed_at=? WHERE file_path=?",
             (content, content[:PREVIEW_CHARS], doc_type,
@@ -1361,13 +1387,61 @@ def vision_describe_image(path: str, max_tokens: int = 80) -> str:
     return out.strip()
 
 
-def video_vision_pass(root: str, db_path: str, logger: logging.Logger,
-                      limit: int = 0) -> dict:
-    """视频场景描述 pass：片头 2 帧(2s/4s) + 片尾 2 帧(尾-4s/尾-2s) → Qwen3-VL → 带时间戳入库。
+def zhipu_describe_image(path: str, max_tokens: int = 80) -> str:
+    """智谱 glm-4v-flash 免费云端描述一张图片（720px，返回一句中文描述）。
 
+    依赖 ZHIPU_API_KEY 环境变量(.env/setx); 速度 ~1.2-1.4s/张(比本地 Qwen3-VL 快 ~20 倍)。
+    坑: 64KB base64 上限内 720px 缩图直接可用; 超限自动降 512px 重试。
+    """
+    api_key = os.environ.get("ZHIPU_API_KEY") or os.environ.get("ZHIPUAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("未设置 ZHIPU_API_KEY (智谱 open.bigmodel.cn 免费 glm-4v-flash)")
+    from PIL import Image
+    try:
+        from pillow_heif import register_heif_opener
+        register_heif_opener()  # HEIC 必须注册
+    except ImportError:
+        pass
+    im = Image.open(path)
+    if im.mode != "RGB":
+        im = im.convert("RGB")
+    im.thumbnail((VISION_MAX_SIDE, VISION_MAX_SIDE))
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    if len(b64) > 64 * 1024:
+        im.thumbnail((512, 512))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=75)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+    body = json.dumps({
+        "model": "glm-4v-flash",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            {"type": "text", "text": VISION_PROMPT},
+        ]}],
+        "max_tokens": max_tokens, "temperature": 0.2,
+    }).encode()
+    req = urllib.request.Request(
+        "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+        data=body, headers={"Content-Type": "application/json",
+                            "Authorization": "Bearer " + api_key})
+    with urllib.request.urlopen(req, timeout=VISION_TIMEOUT) as r:
+        out = json.loads(r.read())["choices"][0]["message"]["content"]
+    return out.strip()
+
+
+def video_vision_pass(root: str, db_path: str, logger: logging.Logger,
+                      limit: int = 0, provider: str = "local") -> dict:
+    """视频场景描述 pass：片头 2 帧(2s/4s) + 片尾 2 帧(尾-4s/尾-2s) → 视觉模型 → 带时间戳入库。
+
+    provider: "local"=Qwen3-VL(127.0.0.1:1234) / "zhipu"=智谱glm-4v-flash(免费云端)。
     断点续传：doc_type 以 video-vision 开头即跳过；失败标 ERR|VISIONVID 下次重试。
     """
-    if not _vision_up(wait=True):
+    if provider == "zhipu":
+        if not (os.environ.get("ZHIPU_API_KEY") or os.environ.get("ZHIPUAI_API_KEY")):
+            raise SystemExit("未设置 ZHIPU_API_KEY: 智谱 open.bigmodel.cn 免费 glm-4v-flash")
+    elif not _vision_up(wait=True):
         raise SystemExit(
             "视觉服务器未启动: 先跑 Startup\\Hermes_VisionServer.cmd 或 "
             "llama-server -m D:\\@kaifa\\models\\Qwen3-VL-8B-Instruct-Q4_K_M.gguf "
@@ -1397,23 +1471,15 @@ def video_vision_pass(root: str, db_path: str, logger: logging.Logger,
                 creationflags=0x08000000,  # CREATE_NO_WINDOW 防弹窗
             ).stdout.strip()
             dur = float(dur_s or 0)
-            # 2. 片头 1 帧(2s) + 片尾 1 帧(尾-2s)，夹紧去重
-            ts_list = sorted({round(max(0.0, min(t, max(0.0, dur - 0.5))), 1)
-                              for t in (2.0, dur - 2.0)})
-            # 3. 抽帧
-            import tempfile
-            fp_dir = tempfile.mkdtemp(prefix="gzv_", dir=tmp_root)
-            for j, ts in enumerate(ts_list):
-                out = os.path.join(fp_dir, f"f{j}.jpg")
-                subprocess.run([FFMPEG_BIN, "-y", "-v", "error", "-ss", str(ts),
-                                "-i", path, "-frames:v", "1", "-q:v", "3", out],
-                               timeout=120, check=True,
-                               creationflags=0x08000000)  # CREATE_NO_WINDOW 防弹窗
-                frames.append((ts, out))
+            # 2. 头尾各 1 帧（2s + 尾-2s），夹紧去重
+            frames = _extract_head_tail_frames(path, dur, n_head=1, n_tail=1)
             # 4. 逐帧识别
             lines = []
             for ts, fpath in frames:
-                desc = vision_describe_image(fpath)
+                if provider == "zhipu":
+                    desc = zhipu_describe_image(fpath)
+                else:
+                    desc = vision_describe_image(fpath)
                 mm, ss = int(ts // 60), int(ts % 60)
                 lines.append(f"[{mm:02d}:{ss:02d}] {VISION_MARK} {desc}")
                 result["frames"] += 1
@@ -1464,10 +1530,14 @@ def main():
                     help="视频抽帧OCR:每2秒1帧→Umi-OCR→去重带时间戳入库(断点续传)")
     ap.add_argument("--vision-desc", action="store_true",
                     help="Qwen3-VL 场景描述: 补齐无文字/未处理/超大跳过图片(断点续传)")
+    ap.add_argument("--vision-desc-zhipu", action="store_true",
+                    help="智谱glm-4v-flash 免费云端场景描述: 补齐无文字/未处理/超大跳过图片(断点续传)")
     ap.add_argument("--vision-desc-all", action="store_true",
                     help="Qwen3-VL 场景描述: 全部图片")
     ap.add_argument("--vision-video", action="store_true",
                     help="视频场景描述: 片头片尾各2帧→Qwen3-VL→带时间戳入库(断点续传)")
+    ap.add_argument("--vision-video-zhipu", action="store_true",
+                    help="视频场景描述: 片头片尾各2帧→智谱glm-4v-flash→带时间戳入库(断点续传)")
     ap.add_argument("--vision-limit", type=int, default=0,
                     help="VISION 限量处理(测试用)")
     ap.add_argument("--exclude-video-dir", action="append", default=[],
@@ -1503,9 +1573,19 @@ def main():
                              all_images=args.vision_desc_all, limit=args.vision_limit)
         logger.info("VISION 耗时 %s -> %s", datetime.now() - t0, r)
         return
+    if args.vision_desc_zhipu:
+        r = vision_desc_pass(args.root, args.db, logger,
+                             all_images=False, limit=args.vision_limit, provider="zhipu")
+        logger.info("VISION-ZHIPU 耗时 %s -> %s", datetime.now() - t0, r)
+        return
     if args.vision_video:
         r = video_vision_pass(args.root, args.db, logger, limit=args.vision_limit)
         logger.info("视频VISION 耗时 %s -> %s", datetime.now() - t0, r)
+        return
+    if args.vision_video_zhipu:
+        r = video_vision_pass(args.root, args.db, logger, limit=args.vision_limit,
+                              provider="zhipu")
+        logger.info("视频VISION-ZHIPU 耗时 %s -> %s", datetime.now() - t0, r)
         return
     scan(args.root, args.db, args.workers, args.merge_media, logger)
     if args.ocr_media:

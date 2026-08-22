@@ -72,6 +72,21 @@ python scripts/file_search.py --stats                      # 库状态
 - 行为：有新增/变更 → 输出摘要（含汇编结果）；有失败 → 警报；无变化 → 静默
 - 查看运行记录：`cronjob(action='list')`；改投递目标用 `cronjob(action='update', deliver='telegram')`
 
+## 模式6: Viking 知识库导出（lib_to_viking.py，2026-08-23）
+
+把任意 gongzuo 索引库内容导出到 OpenViking 记忆库（HTTP API），供语义检索/跨会话召回。**参数化通用版**：
+
+```bash
+python scripts/lib_to_viking.py --db "库.db" --root "根目录" \
+    --base "viking://user/default/resources/库名" --name 库名
+```
+
+- 首次全量导出，之后增量只传新增/变更（指纹=mtime+size，状态文件 `<name>_to_viking.state.json`）
+- 幂等：同 URI 重复添加=更新；409 busy 自动重试（15 次×8s）
+- 每文件渲染 markdown（元数据+OCR文字+【画面】描述）→ temp_upload → POST /resources
+- watchdog 语义：有新增打印摘要、无新增静默（exit 0）
+- 依赖：OpenViking 服务（127.0.0.1:1933，dev 模式无鉴权），需先有 doc_indexer 建好的索引库
+
 ## 模式4: 状态查询
 
 ```bash
@@ -139,6 +154,26 @@ python scripts/doc_indexer.py --vision-video [--vision-limit N]
 - 坑（2026-08-14 实测修复）：①HEIC 必须先 `register_heif_opener()` 否则 cannot identify（已写进 vision_describe_image）②.gif 不在 OCR_EXTS 会漏（已加入 PIL_CONVERT_EXTS）③视觉上限 60MB（>60MB 长图跳过）④服务器冷启动约 15s，索引器会等 60s（_vision_up wait=True）
 - 模型：Qwen3-VL-8B Q4_K_M + mmproj（unsloth 文本 + 官方投影器配对），细节见 llama-cpp 技能
 
+### 智谱 GLM-4V-Flash 场景描述（模式1.7，2026-08 上线）
+
+云端免费视觉模型给图片/视频补"画面里是什么"——无需本地 llama-server，速度 ~1.2-1.4s/张（比 Qwen3-VL 本地快 20 倍）：
+
+```bash
+# 图片缺口模式(默认): 只处理无文字/未处理/超大跳过图片
+python scripts/doc_indexer.py --vision-desc-zhipu
+# 视频场景描述(智谱): 头尾各1帧 → glm-4v-flash → [mm:ss] 入库, ~3s/条
+python scripts/doc_indexer.py --vision-video-zhipu
+# 限量测试
+python scripts/doc_indexer.py --vision-desc-zhipu --vision-limit 3
+```
+
+- **⚠ 重要坑**：`--ocr-media`/`--vision-*`/`--ocr-video` 等模式**必须显式带 `--root`**，否则 main() 会先无条件 scan 默认 root 把无关文件写进库！每次调用都要 `--root "目标目录" --db 库路径`
+- **视频抽帧策略（2026-08-23 起）**：视频 OCR/场景描述一律**头尾各 1 帧**（2s 处 + 尾-2s 处），不再逐 2 秒扫全片——`_extract_head_tail_frames()` 实现
+- 图片写入：content_text 追加 `【画面】 描述`，doc_type=`media-vision-zhipu`，断点续传
+- 依赖：`ZHIPU_API_KEY` 环境变量（.env / setx 均可），智谱 open.bigmodel.cn，模型 glm-4v-flash（免费）
+- 与本地 Qwen3-VL（--vision-desc）并存：缺口查询条件相同，先跑哪个就锁定 doc_type，另一个自动跳过已处理图
+- 坑：智谱敏感审核（code 1301）极小图会误判拦截；超长图（详情页长图）需分段裁剪识别（详见 gongzuo 技能内文档）
+
 ### jieba 分词（搜索端）
 file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期开销。
 
@@ -146,8 +181,9 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 - 全文件索引: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile
 - 搜索: jieba（本机已装）
 - 图片OCR: Umi-OCR(本地安装), Pillow, pillow-heif(HEIC)
-- 图片场景描述: Qwen3-VL-8B llama-server(127.0.0.1:1234,本地模型)
+- 图片场景描述: 智谱 glm-4v-flash 云端(免费,ZHIPU_API_KEY) 或 Qwen3-VL-8B llama-server(127.0.0.1:1234,本地模型)
 - 视频OCR: ffmpeg/ffprobe（需加入 PATH）
+- Viking 导出: OpenViking 服务(127.0.0.1:1933)
 - 系统: antiword（git-bash 自带 /mingw64/bin）
 
 ## 已知坑
