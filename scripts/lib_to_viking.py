@@ -126,11 +126,15 @@ def main():
     ap.add_argument("--root", required=True, help="被索引的根目录(用于算相对路径)")
     ap.add_argument("--base", required=True, help="viking 资源基础 URI, 如 viking://user/default/resources/bdsync")
     ap.add_argument("--name", required=True, help="库显示名(用于状态文件与摘要)")
+    ap.add_argument("--state-name", default=None,
+                    help="状态文件基名(默认=--name; 旧脚本迁移时传 xhp/bdsync 对齐旧 state)")
     ap.add_argument("--reason", default="gongzuo 自动索引导出", help="viking 资源 reason")
     args = ap.parse_args()
+    if not args.state_name:
+        args.state_name = args.name
 
     state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              f"{args.name}_to_viking.state.json")
+                              f"{args.state_name}_to_viking.state.json")
     lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              f"{args.name}_to_viking.lock")
 
