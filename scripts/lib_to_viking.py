@@ -31,8 +31,8 @@ import urllib.error
 VIKING = "http://127.0.0.1:1933"
 MAX_CHARS = 300_000          # 单文件正文入库上限
 SLEEP_BETWEEN_ADDS = 0.25    # 提交间隔(秒)
-CONFLICT_RETRIES = 15
-CONFLICT_BACKOFF = 8
+CONFLICT_RETRIES = 3         # 409 busy 重试次数(队列慢时快速跳过, 留待下次增量补)
+CONFLICT_BACKOFF = 4         # 秒
 
 
 def now():
@@ -129,6 +129,8 @@ def main():
     ap.add_argument("--state-name", default=None,
                     help="状态文件基名(默认=--name; 旧脚本迁移时传 xhp/bdsync 对齐旧 state)")
     ap.add_argument("--reason", default="gongzuo 自动索引导出", help="viking 资源 reason")
+    ap.add_argument("--max-adds", type=int, default=0,
+                    help="本轮最多成功提交新文件数(0=不限); 分批导出用, 防止 viking 队列积压导致后半段全 409")
     args = ap.parse_args()
     if not args.state_name:
         args.state_name = args.name
@@ -181,6 +183,9 @@ def _main(args, state_file):
 
     changed = skipped = 0
     for row in rows:
+        if args.max_adds and changed >= args.max_adds:
+            print(f"[{now()}] 已达本轮上限 --max-adds {args.max_adds} (成功 {changed}), 剩余留待下一轮")
+            break
         path = row["file_path"]
         if not os.path.exists(path):
             continue
