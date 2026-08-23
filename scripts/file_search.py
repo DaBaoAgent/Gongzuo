@@ -69,7 +69,7 @@ def qq(tok: str) -> str:
 
 
 def search(conn: sqlite3.Connection, query: str, ext=None, folder=None,
-           doc_type=None, limit=30, name_only=False):
+           doc_type=None, limit=30, name_only=False, after=None, before=None):
     toks = tokenize(query)
     if not toks:
         return [], toks
@@ -91,6 +91,12 @@ def search(conn: sqlite3.Connection, query: str, ext=None, folder=None,
         base_conds.append("m.is_media = 1")
     elif doc_type == "doc":
         base_conds.append("m.is_media = 0")
+    if after:
+        base_conds.append("m.file_mtime >= ?")
+        base_params.append(after)
+    if before:
+        base_conds.append("m.file_mtime <= ?")
+        base_params.append(before)
 
     def like_cond(tok):
         pat = f"%{tok}%"
@@ -213,7 +219,7 @@ def do_action(rows, conn, action, idx):
         print(row[0] if row and row[0] else "(无正文/二进制文件)")
 
 
-def stats(db_path):
+def stats(db_path, full=False):
     if not os.path.exists(db_path):
         print(f"数据库不存在: {db_path}")
         return
@@ -225,6 +231,28 @@ def stats(db_path):
     db_size = os.path.getsize(db_path) / 1024 / 1024
     print(f"文件总数: {total}  文档: {docs}  媒体元数据: {media}  失败: {errs}")
     print(f"库大小: {db_size:.1f} MB")
+    if full:
+        # 覆盖率: 各 doc_type 分布 + 未处理缺口
+        print("")
+        print("-- doc_type 分布 --")
+        rows = conn.execute(
+            "SELECT COALESCE(doc_type,'plain') AS t, COUNT(*) FROM files "
+            "GROUP BY t ORDER BY COUNT(*) DESC").fetchall()
+        for t, c in rows:
+            print(f"  {t}: {c}")
+        # 关键缺口: 无正文图片(未OCR/未描述)、无描述视频
+        img_gap = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE is_media=1 AND file_ext IN "
+            "('.jpg','.jpeg','.png','.webp','.bmp','.tif','.heic','.heif') "
+            "AND (content_text IS NULL OR content_text='' OR content_text LIKE 'ERR|%')").fetchone()[0]
+        vid_gap = conn.execute(
+            "SELECT COUNT(*) FROM files WHERE is_media=1 AND file_ext IN "
+            "('.mp4','.mov','.avi','.mkv','.flv','.wmv','.m4v','.ts') "
+            "AND (content_text IS NULL OR content_text='' OR content_text LIKE 'ERR|%')").fetchone()[0]
+        print("")
+        print("-- 待处理缺口 --")
+        print(f"  图片未识别/未描述: {img_gap}")
+        print(f"  视频未识别/未描述: {vid_gap}")
     conn.close()
 
 
@@ -237,24 +265,32 @@ def main():
     ap.add_argument("--type", dest="doc_type", default=None, choices=["doc", "media"])
     ap.add_argument("--limit", type=int, default=30)
     ap.add_argument("--name-only", action="store_true", help="只在文件名/路径中搜")
+    ap.add_argument("--after", default=None, help="只搜修改时间 >= 该值(YYYY-MM-DD)")
+    ap.add_argument("--before", default=None, help="只搜修改时间 <= 该值(YYYY-MM-DD)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--copy", type=int, help="复制第N个结果的路径到剪贴板")
     ap.add_argument("--open", type=int, help="打开第N个结果")
     ap.add_argument("--dir", type=int, help="资源管理器定位第N个结果")
     ap.add_argument("--content", type=int, help="打印第N个结果的全文")
     ap.add_argument("--stats", action="store_true")
+    ap.add_argument("--full", action="store_true", help="--stats 时显示 doc_type 分布与待处理缺口")
     args = ap.parse_args()
 
     if args.stats:
-        stats(args.db)
+        stats(args.db, full=args.full)
         return
     if not args.query:
         ap.print_help()
         return
 
+    # 纯日期补全: --after 2026-08-01 → "2026-08-01 00:00:00"；--before 2026-08-01 → "2026-08-01 23:59:59"
+    after = args.after + " 00:00:00" if args.after and len(args.after) == 10 else args.after
+    before = args.before + " 23:59:59" if args.before and len(args.before) == 10 else args.before
+
     conn = sqlite3.connect(args.db)
     rows, toks = search(conn, args.query, ext=args.ext, folder=args.folder,
-                        doc_type=args.doc_type, limit=args.limit, name_only=args.name_only)
+                        doc_type=args.doc_type, limit=args.limit, name_only=args.name_only,
+                        after=after, before=before)
     print_results(rows, toks, args.limit, json_out=args.json)
 
     for act in ("copy", "open", "dir", "content"):

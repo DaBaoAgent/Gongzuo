@@ -128,6 +128,8 @@ def main():
     ap.add_argument("--name", required=True, help="库显示名(用于状态文件与摘要)")
     ap.add_argument("--state-name", default=None,
                     help="状态文件基名(默认=--name; 旧脚本迁移时传 xhp/bdsync 对齐旧 state)")
+    ap.add_argument("--state-dir", default=None,
+                    help="state/lock 文件目录(默认=--db 所在目录, 与库同放避免技能目录被覆盖)")
     ap.add_argument("--reason", default="gongzuo 自动索引导出", help="viking 资源 reason")
     ap.add_argument("--max-adds", type=int, default=0,
                     help="本轮最多成功提交新文件数(0=不限); 分批导出用, 防止 viking 队列积压导致后半段全 409")
@@ -135,10 +137,9 @@ def main():
     if not args.state_name:
         args.state_name = args.name
 
-    state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                              f"{args.state_name}_to_viking.state.json")
-    lock_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             f"{args.name}_to_viking.lock")
+    state_dir = args.state_dir or os.path.dirname(os.path.abspath(args.db))
+    state_file = os.path.join(state_dir, f"{args.state_name}_to_viking.state.json")
+    lock_file = os.path.join(state_dir, f"{args.name}_to_viking.lock")
 
     # 防重入锁
     if os.path.exists(lock_file):
@@ -173,20 +174,19 @@ def _main(args, state_file):
         except Exception:
             pass
 
+    # 第一遍：只查轻量列（不含 content_text），算变更集后再按需拉正文
     con = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
     con.row_factory = sqlite3.Row
-    rows = con.execute(
+    light_rows = con.execute(
         "SELECT file_path, file_name, file_ext, file_size, file_mtime, folder_path, "
-        "is_media, doc_type, content_text, error FROM files"
+        "is_media, doc_type, error FROM files"
     ).fetchall()
-    con.close()
 
-    changed = skipped = 0
     # 预计算 URI 冲突: 同目录同名不同扩展名(1.docx/1.mp4/1.txt) splitext 后 base 相同
     # → 多个文件映射同一 URI, 后到者必 ResourceBusyError。冲突时改用完整文件名做 URI。
     from collections import Counter
     base_counter = Counter()
-    for row in rows:
+    for row in light_rows:
         path = row["file_path"]
         if not os.path.exists(path):
             continue
@@ -201,10 +201,10 @@ def _main(args, state_file):
         base_counter[base] += 1
     uri_conflict = {b for b, c in base_counter.items() if c > 1}
 
-    for row in rows:
-        if args.max_adds and changed >= args.max_adds:
-            print(f"[{now()}] 已达本轮上限 --max-adds {args.max_adds} (成功 {changed}), 剩余留待下一轮")
-            break
+    # 变更集：指纹 = mtime|size，与 state 对比
+    changed_paths = []
+    skipped = 0
+    for row in light_rows:
         path = row["file_path"]
         if not os.path.exists(path):
             continue
@@ -217,7 +217,39 @@ def _main(args, state_file):
         if known.get(path) == fingerprint:
             skipped += 1
             continue  # 未变化 → 跳过
+        changed_paths.append(path)
+    if not changed_paths:
+        con.close()
+        return 0  # 无新增 → 静默（watchdog 语义）
 
+    # 第二遍：只拉变更文件的完整正文（增量常见场景=几个文件，内存可控）
+    content_by_path = {}
+    for i in range(0, len(changed_paths), 500):  # SQLite 变量上限安全分批
+        batch = changed_paths[i:i + 500]
+        ph = ",".join("?" * len(batch))
+        for row in con.execute(
+                f"SELECT file_path, content_text FROM files WHERE file_path IN ({ph})",
+                batch):
+            content_by_path[row["file_path"]] = row["content_text"]
+    con.close()
+
+    # 渲染 + 提交变更集
+    changed = 0
+    for path in changed_paths:
+        if args.max_adds and changed >= args.max_adds:
+            print(f"[{now()}] 已达本轮上限 --max-adds {args.max_adds} (成功 {changed}), 剩余留待下一轮")
+            break
+        row_light = next((r for r in light_rows if r["file_path"] == path), None)
+        if row_light is None:
+            continue
+        row = dict(row_light)
+        row["content_text"] = content_by_path.get(path)
+        try:
+            real_mtime = os.path.getmtime(path)
+            real_size = os.path.getsize(path)
+        except OSError:
+            continue
+        fingerprint = f"{real_mtime:.0f}|{real_size}"
         rel = os.path.relpath(path, args.root)
         if rel.startswith(".."):
             # 文件在 root 外（如主库混入的 @佳康顺 聊天记录）：
@@ -256,9 +288,9 @@ def _main(args, state_file):
     with open(state_file, "w", encoding="utf-8") as f:
         json.dump({"files": known}, f, ensure_ascii=False, indent=1)
 
-    total = len(rows)
+    total = len(light_rows)
     if changed == 0:
-        return 0  # 无新增 → 静默
+        return 0  # 全部失败 → 静默（下轮重试）
     print(f"[{now()}] {args.name}→Viking 增量导出完成: 库 {total} 文件, 本次新增/更新 {changed}, 未变跳过 {skipped}")
     return 0
 

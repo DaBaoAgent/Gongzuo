@@ -21,12 +21,17 @@ import os
 import re
 import subprocess
 import sys
+import json
+import time
 
 HERE = r"C:\Users\xxx13\AppData\Local\hermes\skills\media\gongzuo\scripts"  # 技能 scripts 绝对路径
 INDEXER = os.path.join(HERE, "doc_indexer.py")
 EXPORTER = os.path.join(HERE, "lib_to_viking.py")
 HERMES_EXPORT = r"C:\Users\xxx13\AppData\Local\hermes\scripts\hermes_to_viking.py"  # 会话→Viking
+ASSEMBLER = r"C:\Users\xxx13\AppData\Local\hermes\scripts\gongzuo_assembly.py"  # 数据汇总→7份汇编md
+SKILL_LIST = r"C:\Users\xxx13\AppData\Local\hermes\scripts\gen_skill_list.py"  # 06-后装技能清单
 ENV_FILE = r"C:\Users\xxx13\AppData\Local\hermes\.env"
+LOCK_FILE = r"D:\@kaifa\gongzuo-data\worklife_daily.lock"  # 与 04:00 gongzuo 任务的并发互斥锁
 
 # 库定义: (显示名, root, db, viking base uri, state_name[对齐旧state])
 LIBRARIES = [
@@ -67,24 +72,29 @@ def run_indexer(root, db, args, label):
         return f"{label} 超时（>{TIMEOUT_INDEX}s）", -1
 
 
-def migrate_state(state_name):
-    """旧脚本 state 迁移：hermes/scripts/<state>_to_viking.state.json → 技能目录（新脚本位置）。
+def migrate_state(state_name, db):
+    """state 文件迁移到 db 同目录（2026-08-23 优化：state 不再放技能目录）。
 
-    旧全量导出(bdsync_to_viking.py/xhp_to_viking.py)写在 hermes/scripts，新脚本(lib_to_viking.py)
-    写在技能 scripts 目录。导出前若技能目录无 state 而旧位置有，先复制，避免明天重跑全量。
+    旧位置依次检查：①技能 scripts（刚改版前）②hermes/scripts（旧全量导出脚本时代）。
+    若 db 同目录无 state 而旧位置有，先复制，避免重跑全量。
     """
+    state_dir = os.path.dirname(os.path.abspath(db))
     here = os.path.dirname(os.path.abspath(__file__))  # 技能 scripts
-    old_dir = r"C:\Users\xxx13\AppData\Local\hermes\scripts"
+    old_dirs = [here, r"C:\Users\xxx13\AppData\Local\hermes\scripts"]
     for loc in ("state.json", "lock"):
-        new_f = os.path.join(here, f"{state_name}_to_viking.{loc}")
-        old_f = os.path.join(old_dir, f"{state_name}_to_viking.{loc}")
-        if not os.path.exists(new_f) and os.path.exists(old_f):
-            try:
-                import shutil
-                shutil.copy2(old_f, new_f)
-                print(f"  [state迁移] {old_f} → {new_f}", flush=True)
-            except Exception as e:
-                print(f"  [state迁移失败] {e}", flush=True)
+        new_f = os.path.join(state_dir, f"{state_name}_to_viking.{loc}")
+        if os.path.exists(new_f):
+            continue
+        for old_dir in old_dirs:
+            old_f = os.path.join(old_dir, f"{state_name}_to_viking.{loc}")
+            if os.path.exists(old_f):
+                try:
+                    import shutil
+                    shutil.copy2(old_f, new_f)
+                    print(f"  [state迁移] {old_f} → {new_f}", flush=True)
+                except Exception as e:
+                    print(f"  [state迁移失败] {e}", flush=True)
+                break
 
 
 def run_export(exporter_args, label):
@@ -156,7 +166,7 @@ def process_library(name, root, db, base_uri, state_name):
 
     # 5. 导出到 Viking（自身增量）
     if not alerts:  # 索引正常才导出
-        migrate_state(state_name)  # 旧 state 迁移，避免重跑全量
+        migrate_state(state_name, db)  # 旧 state 迁移（技能目录/hermes/scripts → db同目录），避免重跑全量
         eout, has_new, erc = run_export(
             ["--db", db, "--root", root, "--base", base_uri,
              "--name", name, "--state-name", state_name],
@@ -173,7 +183,61 @@ def process_library(name, root, db, base_uri, state_name):
     return msgs, alerts
 
 
+def _pid_alive(pid: int) -> bool:
+    """Windows 下检测 PID 是否存活"""
+    try:
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False
+        ctypes.windll.kernel32.CloseHandle(h)
+        return True
+    except Exception:
+        return True  # 无法判断时保守认为存活
+
+
+def acquire_lock() -> bool:
+    """写互斥锁。若已有锁且 PID 存活 → 返回 False（另一实例在跑，退出）。
+    锁文件为 JSON: {"pid": N, "started": "..."}。"""
+    if os.path.exists(LOCK_FILE):
+        try:
+            with open(LOCK_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            pid = data.get("pid")
+            if pid and _pid_alive(pid):
+                print(f"⚠ 已有 worklife 实例在运行 (pid={pid})，本次跳过", flush=True)
+                return False
+        except Exception:
+            pass
+        # 死锁残留（PID 不存在或损坏）→ 删除后重写
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+    with open(LOCK_FILE, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "started": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+    return True
+
+
+def release_lock():
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
 def main():
+    if not acquire_lock():
+        return 1
+    try:
+        return _main()
+    finally:
+        release_lock()
+
+
+def _main():
     load_env()
     all_msgs, all_alerts = [], []
     for name, root, db, base_uri, state_name in LIBRARIES:
@@ -195,6 +259,34 @@ def main():
             all_alerts.append("会话导出Viking: OpenViking 不可达")
     except Exception as e:
         all_alerts.append(f"会话导出Viking异常 {e}")
+
+    # 数据汇总（原 04:00 gongzuo_daily_index 职责并入）：汇编 7 份 md + 06-后装技能清单
+    # 仅当索引链路无异常时执行（汇编依赖库数据；有 alert 说明库可能不完整）
+    if not all_alerts:
+        # 汇编：收集新增数据整合进 @数据汇总 7 份 md
+        try:
+            ra = subprocess.run(
+                [sys.executable, "-u", ASSEMBLER, "--db", LIBRARIES[0][2]],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                timeout=300,
+            )
+            aout = ((ra.stdout or "") + (ra.stderr or "")).strip()
+            if aout and "无新增" not in aout:
+                all_msgs.append("数据汇总: " + aout)
+        except Exception as e:
+            all_alerts.append(f"数据汇总异常 {e}")
+        # 06-后装技能清单：每日全量重生成（技能增删/使用次数变化都能反映）
+        try:
+            rs = subprocess.run(
+                [sys.executable, "-u", SKILL_LIST],
+                capture_output=True, text=True, encoding="utf-8", errors="ignore",
+                timeout=300,
+            )
+            sout = ((rs.stdout or "") + (rs.stderr or "")).strip()
+            if sout:
+                all_msgs.append("06-技能清单: " + sout)
+        except Exception as e:
+            all_alerts.append(f"06-技能清单异常 {e}")
 
     if all_alerts:
         print("⚠ 工作生活文件夹增量：" + "；".join(all_alerts))

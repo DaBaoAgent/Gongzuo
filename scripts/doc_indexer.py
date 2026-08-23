@@ -12,12 +12,10 @@ doc/xls/epub/xmind/代码/配置…），图片/视频/音频只收录元数据�
 - 噪音排除: node_modules/.git/.cache/.codex_* 等 AI 工作目录与二进制/字体/资源映射
   文件默认跳过（--include-noise 可强制纳入）。
 - 增量索引: path+mtime+size 不变且无 error 的文件自动跳过。
-- 媒体文件仅存元数据，--merge-media 可从既有 media_index.db 回填 AI 视觉描述，
-  实现"一个库搜全部"。
+- 媒体文件仅存元数据（文件名/路径可搜），图片/视频内容识别靠 --ocr-media/--vision-*。
 
 用法:
   python doc_indexer.py --root "D:\BaiduSyncdisk" [--db PATH] [--workers N]
-  python doc_indexer.py --root "D:\BaiduSyncdisk" --merge-media D:\@kaifa\gongzuo-data\media_index.db
   python doc_indexer.py --db PATH --stats
 
 依赖: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile, jieba(查询端用)
@@ -26,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -47,6 +46,7 @@ from threading import Lock
 DEFAULT_ROOT = r"D:\BaiduSyncdisk"
 DEFAULT_DB = r"D:\@kaifa\gongzuo-data\file_index.db"
 MAX_WORKERS = 8
+FRAME_CACHE_DIR = r"D:\@kaifa\gongzuo-data\frames_cache"  # 视频头尾帧缓存(OCR/描述共享)
 MAX_TEXT_CHARS = 1_000_000          # 单文件正文入库上限（超限截断，防日志/大PDF撑爆库）
 MAX_PDF_PAGES = 500
 MAX_XLSX_CELLS = 60_000
@@ -76,7 +76,7 @@ SKIP_EXTS = {
     ".gz", ".tgz", ".bz2", ".xz",
 }
 
-# 媒体扩展名 → 元数据收录（可被文件名/路径搜索到；内容回填靠 --merge-media）
+# 媒体扩展名 → 元数据收录（可被文件名/路径搜索到；内容识别靠 OCR/视觉描述 pass）
 MEDIA_EXTS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif",
     ".heic", ".heif", ".nef", ".cr2", ".arw", ".orf", ".rw2", ".dng",
@@ -159,11 +159,13 @@ TRUNC_MARK = "\n…[内容超长已截断]…"
 
 # ── 日志 ────────────────────────────────────────────────────────────────
 def setup_logging(log_path: str) -> logging.Logger:
+    from logging.handlers import RotatingFileHandler
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
+            RotatingFileHandler(log_path, encoding="utf-8",
+                                maxBytes=5 * 1024 * 1024, backupCount=3),  # 5MB×3轮转
             logging.StreamHandler(sys.stdout),
         ],
     )
@@ -821,35 +823,6 @@ def process_one(path: str, get_conn, logger: logging.Logger) -> str:
     return "indexed" if content is not None else ("media" if is_media else "meta-only")
 
 
-def merge_media_descriptions(conn: sqlite3.Connection, media_db_path: str, logger: logging.Logger) -> int:
-    """从既有 media_index.db 回填 AI 视觉描述到 files.content_text。"""
-    if not os.path.exists(media_db_path):
-        logger.warning("media db 不存在: %s", media_db_path)
-        return 0
-    src = sqlite3.connect(media_db_path)
-    rows = src.execute(
-        "SELECT file_path, description, tags FROM media_files WHERE error IS NULL AND description IS NOT NULL"
-    ).fetchall()
-    src.close()
-    n = 0
-    for path, desc, tags in rows:
-        merged = ""
-        if desc:
-            merged += desc
-        if tags:
-            merged += "\n标签: " + tags
-        if merged:
-            merged = "【AI视觉描述】" + merged
-            cur = conn.execute(
-                "UPDATE files SET content_text = ?, content_preview = substr(?, 1, %d), doc_type = 'media-ai' "
-                "WHERE file_path = ? AND is_media = 1" % PREVIEW_CHARS,
-                (merged, merged, path),
-            )
-            n += cur.rowcount
-    conn.commit()
-    return n
-
-
 def ocr_pass(root: str, db_path: str, logger: logging.Logger, only_pdf: bool = False) -> dict:
     """Umi-OCR 识别 pass：给无正文的图片/扫描PDF 提取文字入库。
 
@@ -1029,15 +1002,36 @@ def _extract_frames(path: str, interval: float, max_frames: int) -> tuple[list[s
     return [os.path.join(tmpdir, f) for f in frames], interval
 
 
-def _extract_head_tail_frames(path: str, dur: float | None, n_head: int = 1, n_tail: int = 1) -> list[tuple[float, str]]:
+def _extract_head_tail_frames(path: str, dur: float | None, n_head: int = 1, n_tail: int = 1,
+                              use_cache: bool = True) -> list[tuple[float, str]]:
     """只抽片头/片尾各 n 帧（默认各 1 帧：2s 处 + 尾-2s 处）→ 返回 [(时间戳, 帧路径)]。
 
     视频 OCR/描述用：用户要求轻量抽帧，不逐 2 秒扫全片。
     dur 为 None 或抽帧失败 → 空列表。
+    use_cache=True（默认）：抽帧结果按 (mtime,size,dur) 指纹缓存到 FRAME_CACHE_DIR，
+    视频 OCR 与视频描述两个 pass 共享同一批帧，避免重复抽帧（2026-08-23 优化）。
     """
     if not dur or dur <= 0:
         return []
     import tempfile
+
+    # ---- 帧缓存：命中直接返回 ----
+    if use_cache:
+        try:
+            st = os.stat(path)
+            key = f"{st.st_mtime:.0f}_{st.st_size}_{int(dur)}_{hashlib.md5(path.encode('utf-8')).hexdigest()[:8]}"
+            cache_dir = os.path.join(FRAME_CACHE_DIR, key)
+            idx = os.path.join(cache_dir, "index.json")
+            if os.path.isfile(idx):
+                with open(idx, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                frames = [(float(ts), fp) for ts, fp in meta["frames"]
+                          if os.path.isfile(fp)]
+                if len(frames) == len(meta["frames"]):
+                    return frames
+        except Exception:
+            pass
+
     ts_list = []
     head_ts = [2.0 + i * 1.0 for i in range(n_head)]
     tail_ts = [dur - 2.0 - i * 1.0 for i in range(n_tail)]
@@ -1061,17 +1055,38 @@ def _extract_head_tail_frames(path: str, dur: float | None, n_head: int = 1, n_t
                 frames.append((ts, out))
         except Exception:
             continue
+
+    # ---- 写缓存（帧文件复制到缓存目录，下次复用；跨卷不能用 os.replace）----
+    if use_cache and frames:
+        try:
+            import shutil
+            cache_dir = os.path.join(FRAME_CACHE_DIR, key)
+            os.makedirs(cache_dir, exist_ok=True)
+            meta_frames = []
+            for i, (ts, fp) in enumerate(frames):
+                new_fp = os.path.join(cache_dir, f"f{i}.jpg")
+                try:
+                    shutil.copy2(fp, new_fp)  # copy2: 跨卷安全（C:Temp→D:cache）
+                    meta_frames.append([str(ts), new_fp])
+                except OSError:
+                    meta_frames.append([str(ts), fp])  # 复制失败保留原路径
+            with open(os.path.join(cache_dir, "index.json"), "w", encoding="utf-8") as f:
+                json.dump({"frames": meta_frames}, f)
+            frames = [(float(ts), fp) for ts, fp in meta_frames]  # ts 存的是 str, 读回转 float
+        except Exception:
+            pass  # 缓存失败不影响主流程
     return frames
 
 
 def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
                    exclude_dirs: tuple[str, ...] = ()) -> dict:
-    """视频抽帧 OCR：每 2 秒 1 帧 → Umi-OCR 识别 → 去重带时间戳入库。
+    """视频抽帧 OCR：头尾各 1 帧 → Umi-OCR 识别 → 带时间戳入库。
 
     结果格式（content_text）:
         [00:00-00:04] 海水养硬罗马混凝土越泡越坚固
         [04:00-04:06] 古罗马人掌握了一种失传的超级水泥
     相邻帧文本相同则合并时间段；无文字帧跳过。断点续传（doc_type=video-ocr 跳过）。
+    抽帧结果按 mtime/size/时长 缓存（FRAME_CACHE_DIR），与视频描述 pass 共享。
     exclude_dirs: 排除的子目录（绝对路径前缀），其中视频不识别。
     """
     result = {"ok": 0, "no_text": 0, "failed": 0, "skipped": 0}
@@ -1187,7 +1202,7 @@ def prune_missing(root: str, db_path: str, logger: logging.Logger) -> int:
     return n
 
 
-def scan(root: str, db_path: str, workers: int, merge_media: str | None, logger: logging.Logger):
+def scan(root: str, db_path: str, workers: int, logger: logging.Logger):
     main_conn = init_db(db_path)
     total = skipped = indexed = media = meta = errors = 0
     lock = Lock()
@@ -1235,9 +1250,6 @@ def scan(root: str, db_path: str, workers: int, merge_media: str | None, logger:
                     (status.split("|", 1)[-1], path),
                 )
                 get_conn().commit()
-    if merge_media:
-        n = merge_media_descriptions(main_conn, merge_media, logger)
-        logger.info("媒体描述回填: %d 条", n)
     main_conn.commit()
     logger.info("完成: 共%d 正文索引=%d 媒体元数据=%d 其余元数据=%d 跳过=%d 失败=%d",
                 total, indexed, media, meta, skipped, errors)
@@ -1521,13 +1533,12 @@ def main():
     ap.add_argument("--root", default=DEFAULT_ROOT)
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--workers", type=int, default=MAX_WORKERS)
-    ap.add_argument("--merge-media", default=None, help="既有媒体库路径，回填AI描述")
     ap.add_argument("--ocr-media", action="store_true",
                     help="扫描后用 Umi-OCR 识别无正文图片(断点续传,可重跑)")
     ap.add_argument("--ocr-pdf", action="store_true",
                     help="仅用 Umi-OCR 识别扫描件PDF(无文字层)")
     ap.add_argument("--ocr-video", action="store_true",
-                    help="视频抽帧OCR:每2秒1帧→Umi-OCR→去重带时间戳入库(断点续传)")
+                    help="视频抽帧OCR: 头尾各1帧→Umi-OCR→带时间戳入库(断点续传)")
     ap.add_argument("--vision-desc", action="store_true",
                     help="Qwen3-VL 场景描述: 补齐无文字/未处理/超大跳过图片(断点续传)")
     ap.add_argument("--vision-desc-zhipu", action="store_true",
@@ -1587,7 +1598,7 @@ def main():
                               provider="zhipu")
         logger.info("视频VISION-ZHIPU 耗时 %s -> %s", datetime.now() - t0, r)
         return
-    scan(args.root, args.db, args.workers, args.merge_media, logger)
+    scan(args.root, args.db, args.workers, logger)
     if args.ocr_media:
         r = ocr_pass(args.root, args.db, logger)
         logger.info("OCR 耗时 %s -> %s", datetime.now() - t0, r)
