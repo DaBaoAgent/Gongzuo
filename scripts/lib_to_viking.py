@@ -182,6 +182,25 @@ def _main(args, state_file):
     con.close()
 
     changed = skipped = 0
+    # 预计算 URI 冲突: 同目录同名不同扩展名(1.docx/1.mp4/1.txt) splitext 后 base 相同
+    # → 多个文件映射同一 URI, 后到者必 ResourceBusyError。冲突时改用完整文件名做 URI。
+    from collections import Counter
+    base_counter = Counter()
+    for row in rows:
+        path = row["file_path"]
+        if not os.path.exists(path):
+            continue
+        rel = os.path.relpath(path, args.root)
+        if rel.startswith(".."):
+            abs_norm = os.path.abspath(path).replace("\\", "/").lstrip("/")
+            drive, _, rest = abs_norm.partition(":")
+            uri_path = (drive.lower() + "_" + rest.lstrip("/")) if drive else abs_norm
+        else:
+            uri_path = rel.replace("\\", "/")
+        base, _ = os.path.splitext(uri_path)
+        base_counter[base] += 1
+    uri_conflict = {b for b, c in base_counter.items() if c > 1}
+
     for row in rows:
         if args.max_adds and changed >= args.max_adds:
             print(f"[{now()}] 已达本轮上限 --max-adds {args.max_adds} (成功 {changed}), 剩余留待下一轮")
@@ -208,7 +227,10 @@ def _main(args, state_file):
             uri_path = (drive.lower() + "_" + rest.lstrip("/")) if drive else abs_norm
         else:
             uri_path = rel.replace("\\", "/")
-        base, _ = os.path.splitext(uri_path)
+        base, ext = os.path.splitext(uri_path)
+        if base in uri_conflict and ext:
+            # 冲突: 用完整文件名(含扩展名)保证唯一, 如 1.docx → 1.docx.md
+            base = uri_path
         uri = f"{args.base}/{base}.md"
         try:
             md = render_md(row, rel, args.name)
