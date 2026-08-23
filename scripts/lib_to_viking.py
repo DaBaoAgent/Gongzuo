@@ -195,7 +195,14 @@ def _main(args, state_file):
             continue  # 未变化 → 跳过
 
         rel = os.path.relpath(path, args.root)
-        uri_path = rel.replace("\\", "/")
+        if rel.startswith(".."):
+            # 文件在 root 外（如主库混入的 @佳康顺 聊天记录）：
+            # 用 盘符前缀 + 去前导斜杠的绝对路径 作安全 URI，避免 viking 拒绝 '..' traversal
+            abs_norm = os.path.abspath(path).replace("\\", "/").lstrip("/")
+            drive, _, rest = abs_norm.partition(":")
+            uri_path = (drive.lower() + "_" + rest.lstrip("/")) if drive else abs_norm
+        else:
+            uri_path = rel.replace("\\", "/")
         base, _ = os.path.splitext(uri_path)
         uri = f"{args.base}/{base}.md"
         try:

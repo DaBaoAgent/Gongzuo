@@ -82,7 +82,8 @@ python scripts/lib_to_viking.py --db "库.db" --root "根目录" \
 ```
 
 - 首次全量导出，之后增量只传新增/变更（指纹=mtime+size，状态文件 `<name>_to_viking.state.json`）
-- 幂等：同 URI 重复添加=更新；409 busy 自动重试（15 次×8s）
+- 幂等：同 URI 重复添加=更新；409 busy 自动重试（3 次×4s，队列慢时快速跳过，失败文件下次增量自动补）
+- 坑：库中若有 root 外的文件，relpath 会以 `..` 开头 → viking 拒绝 `Unsafe URI traversal`。已修复：自动映射为 `盘符_绝对路径` 安全 URI
 - 每文件渲染 markdown（元数据+OCR文字+【画面】描述）→ temp_upload → POST /resources
 - watchdog 语义：有新增打印摘要、无新增静默（exit 0）
 - 依赖：OpenViking 服务（127.0.0.1:1933，dev 模式无鉴权），需先有 doc_indexer 建好的索引库
