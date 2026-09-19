@@ -91,31 +91,35 @@ SKIP_NAMES = {
     ".ds_store", "icon\r", "autorun.inf", ".gitignore.swp",
 }
 
-# ── Umi-OCR 本地识别集成 ───────────────────────────────────────────────
-# 图片 → Umi-OCR 提取正文；PDF 无文字层（扫描件）→ 渲染页 → Umi-OCR
-UMI_PORT = 1224
-UMI_HOST = "127.0.0.1"
-UMI_EXE_CANDIDATES = [
-    r"D:\@kaifa\Umi-OCR\Umi-OCR_Rapid_v2.1.5\Umi-OCR.exe",
-    r"D:\@kaifa\Umi-OCR\Umi-OCR.exe",
+# ── Dabao-OCR 本地识别集成 ─────────────────────────────────────────────
+# 图片 → Dabao-OCR 提取正文；PDF 无文字层（扫描件）→ 渲染页 → Dabao-OCR
+# Dabao-OCR = Umi-OCR 剥离版（无 GUI、协议兼容、识别结果逐字符一致，同源 RapidOCR 引擎）。
+# 2026-09-20 起本机唯一 OCR —— Umi-OCR(:1224) 已彻底删除（目录/进程/技能/配置全清）。
+DABAO_PORT = 18224
+DABAO_HOST = "127.0.0.1"
+DABAO_PROJECT = r"D:\@kaifa\Dabao-OCR"
+DABAO_EXE_CANDIDATES = [
+    os.path.join(DABAO_PROJECT, ".venv", "Scripts", "dabao-ocr.exe"),
 ]
-UMI_LANG_HINTS = {
+DABAO_SERVE_LOG = r"D:\@kaifa\gongzuo-data\dabao_serve.log"
+# 语言提示词（取 OCR 服务 /api/ocr/get_options 的 ocr.language 枚举值）
+OCR_LANG_HINTS = {
     "ch": ["简体中文", "models/config_chinese.txt", "chinese"],
     "en": ["English", "models/config_en.txt", "english"],
     "cht": ["繁體中文", "models/config_chinese_cht(v2).txt"],
 }
-# Umi-OCR 直接支持的图片扩展名
-UMI_IMG_EXTS = {".jpg", ".jpe", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-# 可用 Pillow 转 PNG 后交给 Umi-OCR 的扩展名（HEIC/PSD 等）
+# Dabao-OCR 直接支持的图片扩展名
+OCR_IMG_EXTS = {".jpg", ".jpe", ".jpeg", ".jfif", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+# 可用 Pillow 转 PNG 后交给 Dabao-OCR 的扩展名（HEIC/PSD 等）
 PIL_CONVERT_EXTS = {".heic", ".heif", ".psd", ".gif"}
-OCR_EXTS = UMI_IMG_EXTS | PIL_CONVERT_EXTS
+OCR_EXTS = OCR_IMG_EXTS | PIL_CONVERT_EXTS
 OCR_PDF_PAGES = 30          # 扫描件 PDF 最多 OCR 页数
-OCR_MAX_IMG_SIDE = 2880     # 超过此边长先等比缩小（Umi-OCR 提速）
+OCR_MAX_IMG_SIDE = 2880     # 超过此边长先等比缩小（Dabao-OCR 提速）
 OCR_HEIC_MAX_SIDE = 1280    # HEIC 手机原图缩到 720p 级再识别（上传体积-90%，提速5倍+）
 OCR_MAX_FILE_MB = 30        # 超过此大小的图片跳过 OCR（产品原图/PSD 照片，避免卡死）
 OCR_NO_TEXT_MARK = "【无文字图片】"
 # ── Qwen3-VL 本地视觉描述集成 ─────────────────────────────────────────
-# Umi-OCR 只出文字；Qwen3-VL 补"画面里是什么"（主体/颜色/场景）→ 可搜"红色电动轮椅"
+# Dabao-OCR 只出文字；Qwen3-VL 补"画面里是什么"（主体/颜色/场景）→ 可搜"红色电动轮椅"
 VISION_HOST = "127.0.0.1"
 VISION_PORT = 1234
 VISION_MAX_SIDE = 720        # 缩到 720px 提速（~17s/张 vs 原图 ~110s）
@@ -265,68 +269,82 @@ def _cell_text(v) -> str:
     return str(v)
 
 
-# ── Umi-OCR 客户端 ─────────────────────────────────────────────────────
-def _umi_is_up(timeout: float = 1.0) -> bool:
+# ── Dabao-OCR 客户端 ───────────────────────────────────────────────────
+def _dabao_is_up(timeout: float = 1.0) -> bool:
     try:
-        with socket.create_connection((UMI_HOST, UMI_PORT), timeout=timeout):
+        with socket.create_connection((DABAO_HOST, DABAO_PORT), timeout=timeout):
             return True
     except OSError:
         return False
 
 
-def _umi_find_exe() -> str | None:
-    for p in UMI_EXE_CANDIDATES:
+def _dabao_find_exe() -> str | None:
+    for p in DABAO_EXE_CANDIDATES:
         if os.path.isfile(p):
             return p
-    base = r"D:\@kaifa"
-    if os.path.isdir(base):
-        for root, _, files in os.walk(base):
-            if "Umi-OCR.exe" in files and "UmiOCR-data" in os.listdir(root):
-                return os.path.join(root, "Umi-OCR.exe")
     return None
 
 
-def umi_ensure_running(max_wait: int = 60) -> bool:
-    """确保 Umi-OCR 在运行，未运行则启动。返回是否就绪。"""
-    if _umi_is_up():
+def dabao_ensure_running(max_wait: int = 90) -> bool:
+    """确保 Dabao-OCR(:18224) 在运行，未运行则**脱离**拉起 `dabao-ocr serve`。
+
+    与 Dabao-OCR 时代的关键差别：Dabao-OCR 无 GUI、进程内复用引擎、启动 <2s
+    （Umi 冷启动实测最长 ~2.5 分钟，所以那时才需要 200s 的等待窗口）。90s 已是宽松上限。
+    """
+    if _dabao_is_up():
         return True
-    exe = _umi_find_exe()
+    exe = _dabao_find_exe()
     if not exe:
         return False
     try:
+        os.makedirs(os.path.dirname(DABAO_SERVE_LOG), exist_ok=True)
+        log = open(DABAO_SERVE_LOG, "ab")     # 句柄由子进程继承，失败也可排查
+        # 留一行「谁在什么时候拉的」：Dabao-OCR 本体启动几乎不输出，空日志无法归因
+        log.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] doc_indexer: Dabao-OCR 离线 → "
+                  f"拉起 serve --port {DABAO_PORT}\n".encode())
+        log.flush()
+        # 三旗齐加：只给 DETACHED 或只给 NO_WINDOW 时，父进程（cron/gateway）退出会把
+        # 服务一起带走（2026-09-17 实盘踩过，详见 AutoETF scripts/ensure_dabao.py）。
+        flags = (0x00000008 | 0x08000000 | 0x00000200) if os.name == "nt" else 0
         subprocess.Popen(
-            ["cmd", "/c", "start", "", exe],
-            cwd=os.path.dirname(exe),
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            [exe, "serve", "--port", str(DABAO_PORT)],
+            cwd=DABAO_PROJECT, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+            creationflags=flags,
         )
     except Exception:
         return False
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        if _umi_is_up():
+        if _dabao_is_up():
             return True
         time.sleep(1)
     return False
 
 
-def _umi_fetch_options() -> dict:
+def _dabao_fetch_options() -> dict:
     try:
         resp = urllib.request.urlopen(
-            f"http://{UMI_HOST}:{UMI_PORT}/api/ocr/get_options", timeout=10
+            f"http://{DABAO_HOST}:{DABAO_PORT}/api/ocr/get_options", timeout=10
         )
         return json.loads(resp.read().decode())
     except Exception:
         return {}
 
 
-def umi_build_options(lang: str = "ch", parser: str = "multi_para", limit_side: int = OCR_MAX_IMG_SIDE) -> dict:
-    """动态构造 options，兼容 Rapid/Paddle 两种引擎。"""
-    opts_def = _umi_fetch_options()
+def dabao_build_options(lang: str = "ch", parser: str = "single_para", limit_side: int = OCR_MAX_IMG_SIDE) -> dict:
+    """动态构造 options，兼容 Rapid/Paddle 两种引擎。
+
+    parser 默认 single_para（2026-09-11 实测切换）：截图/表格/界面类图片
+    只有 single_para 能按横向阅读顺序输出（同一合成表格图 CER 31.3%→1.9%），
+    multi_para 会把每一列当成独立段落，导致表格内容纵向错位；
+    多段落文档场景两者均为 CER 0.0%，故统一用 single_para 无损失。
+    """
+    opts_def = _dabao_fetch_options()
     options = {"data.format": "text", "tbpu.parser": parser}
     if "ocr.language" in opts_def:
         allowed = opts_def["ocr.language"].get("optionsList", [])
         allowed_vals = {str(v[0]) for v in allowed}
-        for hint in UMI_LANG_HINTS.get(lang, []):
+        for hint in OCR_LANG_HINTS.get(lang, []):
             if hint in allowed_vals:
                 options["ocr.language"] = hint
                 break
@@ -341,12 +359,12 @@ def umi_build_options(lang: str = "ch", parser: str = "multi_para", limit_side: 
     return options
 
 
-def umi_ocr_image(path: str, options: dict) -> str:
+def dabao_ocr_image(path: str, options: dict) -> str:
     """识别一张图，返回纯文本。异常抛出。"""
     b64 = _image_to_b64(path)
     payload = json.dumps({"base64": b64, "options": options}).encode()
     req = urllib.request.Request(
-        f"http://{UMI_HOST}:{UMI_PORT}/api/ocr",
+        f"http://{DABAO_HOST}:{DABAO_PORT}/api/ocr",
         data=payload,
         headers={"Content-Type": "application/json"},
     )
@@ -356,7 +374,7 @@ def umi_ocr_image(path: str, options: dict) -> str:
         return (r.get("data") or "").strip()
     if r.get("code") == 101:
         return ""  # 无文本
-    raise RuntimeError(f"umi-ocr code={r.get('code')} {str(r.get('data'))[:200]}")
+    raise RuntimeError(f"dabao-ocr code={r.get('code')} {str(r.get('data'))[:200]}")
 
 
 def _image_to_b64(path: str) -> str:
@@ -364,7 +382,7 @@ def _image_to_b64(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
     # 伪装检测：扩展名 .jpg 但实际是 HEIC（ftyp 魔数）→ 走 Pillow 转换路径
     disguised_heic = False
-    if ext in UMI_IMG_EXTS:
+    if ext in OCR_IMG_EXTS:
         try:
             with open(path, "rb") as f:
                 if f.read(12)[4:8] == b"ftyp":
@@ -395,7 +413,7 @@ def _image_to_b64(path: str) -> str:
 
 
 def _img_side_too_big(path: str) -> bool:
-    """边长超 OCR_MAX_IMG_SIDE 返回 True。读取失败视为 False（交给 Umi-OCR 自己处理）。"""
+    """边长超 OCR_MAX_IMG_SIDE 返回 True。读取失败视为 False（交给 Dabao-OCR 自己处理）。"""
     try:
         from PIL import Image
         with Image.open(path) as im:
@@ -405,8 +423,8 @@ def _img_side_too_big(path: str) -> bool:
         return False
 
 
-def umi_ocr_pdf(path: str, options: dict, max_pages: int = OCR_PDF_PAGES) -> str:
-    """扫描件 PDF：逐页渲染 PNG → Umi-OCR，拼接文本。返回 (文本, ocr页数)。"""
+def dabao_ocr_pdf(path: str, options: dict, max_pages: int = OCR_PDF_PAGES) -> str:
+    """扫描件 PDF：逐页渲染 PNG → Dabao-OCR，拼接文本。返回 (文本, ocr页数)。"""
     import fitz
     doc = fitz.open(path)
     parts = []
@@ -421,7 +439,7 @@ def umi_ocr_pdf(path: str, options: dict, max_pages: int = OCR_PDF_PAGES) -> str
             b64 = base64.b64encode(buf.getvalue()).decode()
             payload = json.dumps({"base64": b64, "options": options}).encode()
             req = urllib.request.Request(
-                f"http://{UMI_HOST}:{UMI_PORT}/api/ocr",
+                f"http://{DABAO_HOST}:{DABAO_PORT}/api/ocr",
                 data=payload,
                 headers={"Content-Type": "application/json"},
             )
@@ -824,18 +842,18 @@ def process_one(path: str, get_conn, logger: logging.Logger) -> str:
 
 
 def ocr_pass(root: str, db_path: str, logger: logging.Logger, only_pdf: bool = False) -> dict:
-    """Umi-OCR 识别 pass：给无正文的图片/扫描PDF 提取文字入库。
+    """Dabao-OCR 识别 pass：给无正文的图片/扫描PDF 提取文字入库。
 
-    断点续传：已有 content_text 的自动跳过。单线程（Umi-OCR 后端并发差）。
+    断点续传：已有 content_text 的自动跳过。单线程（Dabao-OCR 后端并发差）。
     返回 {"ok": n, "no_text": n, "failed": n, "skipped": n}
     """
     result = {"ok": 0, "no_text": 0, "failed": 0, "skipped": 0}
-    if not umi_ensure_running():
-        logger.warning("Umi-OCR 未运行且无法启动，OCR pass 跳过")
+    if not dabao_ensure_running():
+        logger.warning("Dabao-OCR 未运行且无法启动，OCR pass 跳过")
         result["failed"] = -1
         return result
 
-    options = umi_build_options()
+    options = dabao_build_options()
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -882,10 +900,10 @@ def ocr_pass(root: str, db_path: str, logger: logging.Logger, only_pdf: bool = F
             pass
         try:
             if ext == ".pdf":
-                text, _ = umi_ocr_pdf(path, options)
+                text, _ = dabao_ocr_pdf(path, options)
                 doc_type = "pdf-ocr"
             else:
-                text = umi_ocr_image(path, options)
+                text = dabao_ocr_image(path, options)
                 doc_type = "media-ocr"
         except Exception as e:
             result["failed"] += 1
@@ -1080,7 +1098,7 @@ def _extract_head_tail_frames(path: str, dur: float | None, n_head: int = 1, n_t
 
 def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
                    exclude_dirs: tuple[str, ...] = ()) -> dict:
-    """视频抽帧 OCR：头尾各 1 帧 → Umi-OCR 识别 → 带时间戳入库。
+    """视频抽帧 OCR：头尾各 1 帧 → Dabao-OCR 识别 → 带时间戳入库。
 
     结果格式（content_text）:
         [00:00-00:04] 海水养硬罗马混凝土越泡越坚固
@@ -1094,12 +1112,12 @@ def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
         logger.warning("ffmpeg/ffprobe 不可用，视频 OCR pass 跳过")
         result["failed"] = -1
         return result
-    if not umi_ensure_running():
-        logger.warning("Umi-OCR 未运行且无法启动，视频 OCR pass 跳过")
+    if not dabao_ensure_running():
+        logger.warning("Dabao-OCR 未运行且无法启动，视频 OCR pass 跳过")
         result["failed"] = -1
         return result
 
-    options = umi_build_options()
+    options = dabao_build_options()
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -1131,7 +1149,7 @@ def video_ocr_pass(root: str, db_path: str, logger: logging.Logger,
                 lines = []
                 for ts, fp in frames:
                     try:
-                        text = umi_ocr_image(fp, options)
+                        text = dabao_ocr_image(fp, options)
                     except Exception:
                         text = ""
                     if text:
@@ -1283,7 +1301,7 @@ def vision_desc_pass(root: str, db_path: str, logger: logging.Logger,
     """场景描述 pass：给图片补"画面里是什么"。
 
     provider: "local"=Qwen3-VL(127.0.0.1:1234) / "zhipu"=智谱glm-4v-flash(免费云端)。
-    默认缺口模式：只处理 Umi-OCR 无文字/未处理/超大跳过的图片；
+    默认缺口模式：只处理 Dabao-OCR 无文字/未处理/超大跳过的图片；
     all_images=True 处理全部图片。
     断点续传：doc_type 以 vision 开头即跳过（可反复重跑）。
     """
@@ -1427,7 +1445,7 @@ def zhipu_describe_image(path: str, max_tokens: int = 80) -> str:
         im.save(buf, "JPEG", quality=75)
         b64 = base64.b64encode(buf.getvalue()).decode()
     body = json.dumps({
-        "model": "glm-4v-flash",
+        "model": "glm-5.3-flash",
         "messages": [{"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
             {"type": "text", "text": VISION_PROMPT},
@@ -1534,11 +1552,11 @@ def main():
     ap.add_argument("--db", default=DEFAULT_DB)
     ap.add_argument("--workers", type=int, default=MAX_WORKERS)
     ap.add_argument("--ocr-media", action="store_true",
-                    help="扫描后用 Umi-OCR 识别无正文图片(断点续传,可重跑)")
+                    help="扫描后用 Dabao-OCR 识别无正文图片(断点续传,可重跑)")
     ap.add_argument("--ocr-pdf", action="store_true",
-                    help="仅用 Umi-OCR 识别扫描件PDF(无文字层)")
+                    help="仅用 Dabao-OCR 识别扫描件PDF(无文字层)")
     ap.add_argument("--ocr-video", action="store_true",
-                    help="视频抽帧OCR: 头尾各1帧→Umi-OCR→带时间戳入库(断点续传)")
+                    help="视频抽帧OCR: 头尾各1帧→Dabao-OCR→带时间戳入库(断点续传)")
     ap.add_argument("--vision-desc", action="store_true",
                     help="Qwen3-VL 场景描述: 补齐无文字/未处理/超大跳过图片(断点续传)")
     ap.add_argument("--vision-desc-zhipu", action="store_true",

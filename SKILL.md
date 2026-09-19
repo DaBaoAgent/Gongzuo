@@ -1,7 +1,7 @@
 ---
 name: gongzuo
 version: "2.0"
-description: 文件智能索引与秒级检索。全文件正文全文搜(FTS5 trigram)+Umi-OCR图片视频文字识别，SQLite本地库。
+description: 文件智能索引与秒级检索。全文件正文全文搜(FTS5 trigram)+Dabao-OCR图片视频文字识别，SQLite本地库。
 author: Dabao
 trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件、文档、图片、视频，或要从已索引库中秒级检索内容
 ---
@@ -9,7 +9,7 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 # 文件智能索引与秒级检索 (gongzuo)
 
 > **🔄 合并说明（2026-08-09）**：本技能为"本地文件/媒体索引检索"唯一伞形入口，已吸收两个重叠技能：
-> - `media-indexer` → 其媒体索引能力由 Umi-OCR 本地识别（`--ocr-media`/`--ocr-video`）取代；原付费视觉描述功能已移除
+> - `media-indexer` → 其媒体索引能力由 Dabao-OCR 本地识别（`--ocr-media`/`--ocr-video`）取代；原付费视觉描述功能已移除
 > - `local-file-index` → 其工程模式（FTS5 trigram/提取兜底链/增量）本文已完整覆盖；新增 `references/doc-extraction-fallbacks.md`（各格式提取失败签名与正解）
 > - 检索前先 `file_search.py --stats` 确认库存在（历史教训：库目录被清理后 watchdog 全失效）。
 
@@ -19,7 +19,7 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 
 1. **全文件索引**（doc_indexer.py）— 所有非媒体文件的**正文全文**（txt/md/pdf/docx/xlsx/pptx/doc/xls/epub/xmind/代码/配置…），
    图片/视频/音频存元数据（文件名/路径可搜）。FTS5 **trigram** 分词器，中文 3 字子串精准命中，秒级。
-2. **Umi-OCR 图片/视频识别**（doc_indexer.py --ocr-media/--ocr-video）— 本地免费 OCR 提取图中文字
+2. **Dabao-OCR 图片/视频识别**（doc_indexer.py --ocr-media/--ocr-video）— 本地免费 OCR 提取图中文字
    与视频抽帧字幕/画面文字，可搜图片上的字、视频里的台词。
 
 两者都进 SQLite FTS5，搜索入口统一为 `file_search.py`。
@@ -29,7 +29,7 @@ trigger: 用户要索引/扫描/搜索/查找/定位某个文件夹里的文件�
 ```bash
 python scripts/doc_indexer.py --root "D:\BaiduSyncdisk" --db "D:\@kaifa\gongzuo-data\file_index.db" [--workers 8]
 # 增量：重跑自动跳过 path+mtime+size 未变的文件，只处理新增/变更
-# 图片OCR（Umi-OCR 本地识别，断点续传，可反复重跑）:
+# 图片OCR（Dabao-OCR 本地识别，断点续传，可反复重跑）:
 python scripts/doc_indexer.py --ocr-media
 # 仅扫描件PDF识别:
 python scripts/doc_indexer.py --ocr-pdf
@@ -92,7 +92,7 @@ list 顶层格式（如蒸馏中间产物）无 messages 字段会自动跳过�
 ## 模式4: 每日自动增量索引 + 数据汇总（cron，2026-08-23 起统一由 worklife_daily_index.py 管）
 
 已配置 Hermes cron 任务 `每日增量抓取合并(BDSync+XHP+会话)→Viking`（job 9ef628304b40，每天 **01:00**，script=hermes/scripts/worklife_daily_index.py），
-一次跑完**索引+OCR+描述+导出Viking+数据汇总**（原 04:00 gongzuo 增量索引任务已并入删除，避免重复扫描抢 Umi-OCR）：
+一次跑完**索引+OCR+描述+导出Viking+数据汇总**（原 04:00 gongzuo 增量索引任务已并入删除，避免重复扫描抢 Dabao-OCR）：
 
 - 三路串行：
   - BaiduSyncdisk（file_index.db）→ 增量索引+OCR+智谱描述 → `lib_to_viking.py` 导出
@@ -169,27 +169,27 @@ trigram 按 3 字子串建倒排索引：`MATCH '"电动轮椅"'` 精准命中�
 |------|------|----------|
 | txt/md/json/yaml/csv/html/js/py… | 编码探测直读 | 二进制检测→跳过 |
 | docx/xlsx/pptx | python-docx/openpyxl/python-pptx | — |
-| pdf | PyMuPDF 逐页(≤500页) | 无文字层(扫描件)→ `--ocr-pdf` 用 Umi-OCR 逐页渲染识别 |
+| pdf | PyMuPDF 逐页(≤500页) | 无文字层(扫描件)→ `--ocr-pdf` 用 Dabao-OCR 逐页渲染识别 |
 | doc(老格式) | antiword -m UTF-8 | RTF/HTML伪装嗅探→olefile UTF-16流抽可读段 |
 | xls | xlrd | — |
 | epub/xmind/odt | zip 解包抽文本/标题 | — |
-| 图片 jpg/png/bmp/webp/tif | 元数据 only | `--ocr-media` 用 Umi-OCR 提取图中文字 |
-| 图片 heic/heif/psd | 元数据 only | Pillow(pillow-heif) 转 PNG 后 Umi-OCR |
-| 视频/音频 | 元数据 only | `--ocr-video` 抽帧 Umi-OCR 识别画面文字/字幕 |
+| 图片 jpg/png/bmp/webp/tif | 元数据 only | `--ocr-media` 用 Dabao-OCR 提取图中文字 |
+| 图片 heic/heif/psd | 元数据 only | Pillow(pillow-heif) 转 PNG 后 Dabao-OCR |
+| 视频/音频 | 元数据 only | `--ocr-video` 抽帧 Dabao-OCR 识别画面文字/字幕 |
 
-### Umi-OCR 图片识别集成（模式1.5）
+### Dabao-OCR 图片识别集成（模式1.5）
 
-`doc_indexer.py --ocr-media` 会调用本机 Umi-OCR(127.0.0.1:1224)给**无正文图片**提取文字入库：
+`doc_indexer.py --ocr-media` 会调用本机 Dabao-OCR(127.0.0.1:18224)给**无正文图片**提取文字入库：
 
 - 覆盖 jpg/jpeg/png/webp/bmp/tif + heic/heif/psd(Pillow 转换)，超大图自动缩至 2880px
 - **断点续传**：已有 content_text 的跳过；失败标 `ERR|OCR|...` 下次重跑自动重试
-- **单线程**跑（Umi-OCR 后端并发差，勿加 workers）；~0.2-1s/张
+- **单线程**跑（Dabao-OCR 后端并发差，勿加 workers）；~0.2-1s/张
 - 无文字图片标记 `【无文字图片】`（doc_type=media-ocr-notext），避免反复重试
 - 全量 8296 张约 1.5-2.5 小时；增量只处理新增/失败，秒级
-- 依赖：Umi-OCR exe 已装 `D:\@kaifa\Umi-OCR\`（**单图/交互式识别用 umi-ocr 技能**），Pillow + pillow-heif
+- 依赖：Dabao-OCR exe 已装 `D:\@kaifa\Dabao-OCR\`（**单图/交互式识别用 dabao-ocr 技能**），Pillow + pillow-heif
 - 坑：HEIC 必须 `from pillow_heif import register_heif_opener; register_heif_opener()` 再 Image.open，否则 cannot identify
-- 坑：伪装 HEIC（扩展名 .jpg 但内容 ftyp 魔数）→ `_image_to_b64` 已做 ftyp 嗅探自动转换，Umi-OCR 报 code=301 imdecode failed 时先查这个
-- 坑：超大图(>30MB)直接送 OCR 会卡死 → 已自动跳过；手机原图缩 720p 提速（详见 umi-ocr 技能 Pitfalls）
+- 坑：伪装 HEIC（扩展名 .jpg 但内容 ftyp 魔数）→ `_image_to_b64` 已做 ftyp 嗅探自动转换，Dabao-OCR 报 code=301 imdecode failed 时先查这个
+- 坑：超大图(>30MB)直接送 OCR 会卡死 → 已自动跳过；手机原图缩 720p 提速（详见 dabao-ocr 技能 Pitfalls）
 
 ### 智谱 GLM-4V-Flash 场景描述（模式1.7，2026-08-17 上线）
 
@@ -218,7 +218,7 @@ python scripts/doc_indexer.py --vision-desc-zhipu --vision-limit 3
 
 ### Qwen3-VL 场景描述集成（模式1.6，2026-08-14 上线）
 
-本地视觉模型给图片补"画面里是什么"——Umi-OCR 只出文字，Qwen3-VL 出主体/颜色/场景描述，进 FTS 可搜（如"红色电动轮椅"、"摄影棚"、"展厅"）：
+本地视觉模型给图片补"画面里是什么"——Dabao-OCR 只出文字，Qwen3-VL 出主体/颜色/场景描述，进 FTS 可搜（如"红色电动轮椅"、"摄影棚"、"展厅"）：
 
 ```bash
 # 缺口模式(默认): 只处理无文字/未处理/超大跳过图片(~678张,断点续传)
@@ -245,7 +245,7 @@ file_search.py 用 jieba.cut_for_search 拆查询词，不落库，无索引期�
 ### 依赖
 - 全文件索引: fitz(PyMuPDF), python-docx, openpyxl, python-pptx, xlrd, olefile
 - 搜索: jieba（本机已装）
-- 图片OCR: Umi-OCR exe(D:\@kaifa\Umi-OCR\,skill: umi-ocr), Pillow, pillow-heif(HEIC)
+- 图片OCR: Dabao-OCR exe(D:\@kaifa\Dabao-OCR\,skill: dabao-ocr), Pillow, pillow-heif(HEIC)
 - 图片/视频场景描述: 智谱 glm-4v-flash 云端(免费,key=ZHIPU_API_KEY) 或 Qwen3-VL-8B llama-server(127.0.0.1:1234,模型在 D:\@kaifa\models\,自启 Startup\Hermes_VisionServer.cmd)
 - 视频OCR: ffmpeg/ffprobe (C:\Users\xxx13\ffmpeg\ffmpeg-8.1.1-essentials_build\bin)
 - 系统: antiword（git-bash 自带 /mingw64/bin）

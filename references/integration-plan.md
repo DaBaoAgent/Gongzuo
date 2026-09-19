@@ -57,7 +57,7 @@ D:\@kaifa\gongzuo-data\file_index.db
 | 电子书 | epub | zip 解包剥 HTML | 全文 |
 | 邮件 | eml | email 库 | 正文 |
 | 存档 | zip 7z rar | 内文件名清单(7z 需安装 7-Zip) | 包内文件名 |
-| 图片/视频/音频 | jpg png mp4 mov mp3… | **元数据 only**（名称/路径可搜；图片/视频文字用 Umi-OCR 识别后回填） | 文件名/路径 |
+| 图片/视频/音频 | jpg png mp4 mov mp3… | **元数据 only**（名称/路径可搜；图片/视频文字用 Dabao-OCR 识别后回填） | 文件名/路径 |
 | 噪音 | node_modules .git .cache .codex_* ttf map exe… | **跳过不索引** | — |
 
 ## 四、搜索策略（精准优先，召回兜底）
@@ -92,7 +92,7 @@ schtasks /create /tn "gongzuo索引" /tr "python D:\...\doc_indexer.py --root D:
 
 ## 六、已知限制（如实声明）
 
-- **扫描型 PDF**（图片扫描件）无文字层，已用 Umi-OCR 逐页识别（`--ocr-pdf`）
+- **扫描型 PDF**（图片扫描件）无文字层，已用 Dabao-OCR 逐页识别（`--ocr-pdf`）
 - 单文件正文上限 100 万字符（防日志/超大 PDF 撑爆索引），超限部分不搜
 - trigram 索引体积约为正文 3 倍（46K 文件 ≈ 库 200-400MB，可接受）
 - 2 字中文词走 LIKE（速度仍 <0.5s），3 字以上走精确索引
