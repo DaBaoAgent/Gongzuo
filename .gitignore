@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+
+# runtime logs
+*.log
+*.err
