@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""工作生活文件夹 每日增量抓取+导出Viking 合并 watchdog（cron 用）
+"""工作生活文件夹 每日增量抓取+索引 合并 watchdog（cron 用）
 
 每天 01:00 由 Hermes cron 调用，处理两个工作生活文件夹：
 A. D:\\BaiduSyncdisk      → file_index.db  (gongzuo 主库)
@@ -10,7 +10,7 @@ B. D:\\自动剪辑\\XHP-知识库 → xhp_kb.db
 2. 智谱图片场景描述（--vision-desc-zhipu，缺口模式）
 3. 智谱视频场景描述（--vision-video-zhipu，头尾各1帧）
 4. 视频 OCR（--ocr-video，头尾各1帧）
-5. lib_to_viking.py 导出到 OpenViking（参数化通用版，自身增量）
+5. （2026-11-10 停用）原导出 OpenViking 步骤已移除；索引数据保留在本地 SQLite，用 gongzuo 的 FTS5 检索。
 
 输出规则（no_agent watchdog 模式）：
 - 有新增/变更 → 输出摘要（投递通知）
@@ -24,26 +24,22 @@ import sys
 import json
 import time
 
-HERE = r"C:\Users\xxx13\AppData\Local\hermes\skills\media\gongzuo\scripts"  # 技能 scripts 绝对路径
+HERE = os.path.dirname(os.path.abspath(__file__))  # 脚本同目录
 INDEXER = os.path.join(HERE, "doc_indexer.py")
-EXPORTER = os.path.join(HERE, "lib_to_viking.py")
-HERMES_EXPORT = r"C:\Users\xxx13\AppData\Local\hermes\scripts\hermes_to_viking.py"  # 会话→Viking
+HERMES_EXPORT = os.path.join(HERE, "hermes_to_viking.py")  # 会话→Obsidian
 ASSEMBLER = r"C:\Users\xxx13\AppData\Local\hermes\scripts\gongzuo_assembly.py"  # 数据汇总→7份汇编md
 SKILL_LIST = r"C:\Users\xxx13\AppData\Local\hermes\scripts\gen_skill_list.py"  # 06-后装技能清单
 ENV_FILE = r"C:\Users\xxx13\AppData\Local\hermes\.env"
 LOCK_FILE = r"D:\@kaifa\gongzuo-data\worklife_daily.lock"  # 与 04:00 gongzuo 任务的并发互斥锁
 
-# 库定义: (显示名, root, db, viking base uri, state_name[对齐旧state])
+# 库定义: (显示名, root, db, state_name[对齐旧state])
 LIBRARIES = [
     ("BaiduSyncdisk", r"D:\BaiduSyncdisk",
-     r"D:\@kaifa\gongzuo-data\file_index.db",
-     "viking://user/default/resources/bdsync", "bdsync"),
+     r"D:\@kaifa\gongzuo-data\file_index.db", "bdsync"),
     ("XHP知识库", r"D:\自动剪辑\XHP-知识库",
-     r"D:\@kaifa\gongzuo-data\xhp_kb.db",
-     "viking://user/default/resources/xhp_knowledge", "xhp"),
+     r"D:\@kaifa\gongzuo-data\xhp_kb.db", "xhp"),
 ]
 TIMEOUT_INDEX = 5400   # 索引+OCR 90 分钟
-TIMEOUT_EXPORT = 21600  # 导出 6 小时（首次全量 9696 文件需 ~2 小时提交）
 
 
 def load_env():
@@ -72,47 +68,8 @@ def run_indexer(root, db, args, label):
         return f"{label} 超时（>{TIMEOUT_INDEX}s）", -1
 
 
-def migrate_state(state_name, db):
-    """state 文件迁移到 db 同目录（2026-08-23 优化：state 不再放技能目录）。
-
-    旧位置依次检查：①技能 scripts（刚改版前）②hermes/scripts（旧全量导出脚本时代）。
-    若 db 同目录无 state 而旧位置有，先复制，避免重跑全量。
-    """
-    state_dir = os.path.dirname(os.path.abspath(db))
-    here = os.path.dirname(os.path.abspath(__file__))  # 技能 scripts
-    old_dirs = [here, r"C:\Users\xxx13\AppData\Local\hermes\scripts"]
-    for loc in ("state.json", "lock"):
-        new_f = os.path.join(state_dir, f"{state_name}_to_viking.{loc}")
-        if os.path.exists(new_f):
-            continue
-        for old_dir in old_dirs:
-            old_f = os.path.join(old_dir, f"{state_name}_to_viking.{loc}")
-            if os.path.exists(old_f):
-                try:
-                    import shutil
-                    shutil.copy2(old_f, new_f)
-                    print(f"  [state迁移] {old_f} → {new_f}", flush=True)
-                except Exception as e:
-                    print(f"  [state迁移失败] {e}", flush=True)
-                break
-
-
-def run_export(exporter_args, label):
-    """跑 lib_to_viking 导出，返回 (输出, 有无新增, returncode)"""
-    try:
-        r = subprocess.run(
-            [sys.executable, "-u", EXPORTER] + exporter_args,
-            capture_output=True, text=True, encoding="utf-8", errors="ignore",
-            timeout=TIMEOUT_EXPORT,
-        )
-        out = ((r.stdout or "") + (r.stderr or "")).strip()
-        return out, ("增量导出完成" in out), r.returncode
-    except subprocess.TimeoutExpired:
-        return f"{label} 导出超时", False, -1
-
-
-def process_library(name, root, db, base_uri, state_name):
-    """处理一个库：索引+OCR+描述+导出，返回 (msgs, alerts)"""
+def process_library(name, root, db, state_name):
+    """处理一个库：索引+OCR+描述，返回 (msgs, alerts)"""
     msgs, alerts = [], []
 
     # 1. 增量扫描 + 图片 OCR
@@ -163,18 +120,6 @@ def process_library(name, root, db, base_uri, state_name):
             alerts.append(f"{name} 视频OCR失败 {vo_failed}")
         if vo_ok + vo_no_text > 0:
             msgs.append(f"{name} 视频OCR {vo_ok}个+{vo_no_text}无文字")
-
-    # 5. 导出到 Viking（自身增量）
-    if not alerts:  # 索引正常才导出
-        migrate_state(state_name, db)  # 旧 state 迁移（技能目录/hermes/scripts → db同目录），避免重跑全量
-        eout, has_new, erc = run_export(
-            ["--db", db, "--root", root, "--base", base_uri,
-             "--name", name, "--state-name", state_name],
-            name + " 导出")
-        if erc != 0:
-            alerts.append(f"{name} Viking导出异常(rc={erc}): {eout[-200:]}")
-        elif has_new:
-            msgs.append(f"{name} 导出Viking: " + eout.split("增量导出完成: ")[-1])
 
     # 新增汇总
     new_total = new_docs + new_media + meta
@@ -240,12 +185,12 @@ def main():
 def _main():
     load_env()
     all_msgs, all_alerts = [], []
-    for name, root, db, base_uri, state_name in LIBRARIES:
-        msgs, alerts = process_library(name, root, db, base_uri, state_name)
+    for name, root, db, state_name in LIBRARIES:
+        msgs, alerts = process_library(name, root, db, state_name)
         all_msgs.extend(msgs)
         all_alerts.extend(alerts)
 
-    # Hermes 会话 → Viking（自身增量：有新消息打印，无则静默）
+    # Hermes 会话 → Obsidian（自身增量：有新消息打印，无则静默）
     try:
         rh = subprocess.run(
             [sys.executable, "-u", HERMES_EXPORT],
@@ -254,11 +199,11 @@ def _main():
         )
         hout = ((rh.stdout or "") + (rh.stderr or "")).strip()
         if "增量导出完成" in hout:
-            all_msgs.append("会话导出Viking: " + hout.split("增量导出完成: ")[-1])
-        elif "OpenViking 不可达" in hout:
-            all_alerts.append("会话导出Viking: OpenViking 不可达")
+            all_msgs.append("会话导出Obsidian: " + hout.split("增量导出完成: ")[-1])
+        elif "state.db 不存在" in hout:
+            all_alerts.append("会话导出Obsidian: state.db 不存在")
     except Exception as e:
-        all_alerts.append(f"会话导出Viking异常 {e}")
+        all_alerts.append(f"会话导出Obsidian异常 {e}")
 
     # 数据汇总（原 04:00 gongzuo_daily_index 职责并入）：汇编 7 份 md + 06-后装技能清单
     # 仅当索引链路无异常时执行（汇编依赖库数据；有 alert 说明库可能不完整）

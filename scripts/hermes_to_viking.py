@@ -6,12 +6,12 @@ hermes/scripts/hermes_to_viking.py（薄副本）。
 改逻辑改本文件后必须同步副本；不要直接运行本文件（state 会写技能目录）。
 """
 """
-hermes_to_viking.py — Hermes 会话(state.db) → OpenViking 增量导出
+hermes_to_viking.py — Hermes 会话(state.db) → Obsidian 增量导出
 ============================================================
 - 全量首次导出: 所有会话全部消息(含 role=tool 的 tool 消息、tool_calls)
 - 增量: 以 messages.id 为游标, 只处理新消息
-- 输出: 每会话每日一个 markdown 文件 → D:\\@kaifa\\openviking\\data\\hermes_sessions\\
-- 导入: HTTP temp_upload + POST /resources (同 URI 重复添加 = 更新, 409 重试)
+- 输出: 每会话每日一个 markdown 文件 → D:\\@kaifa\\Obsidian知识库\\03 资料库\\Hermes会话完整原文\\
+- 说明: OpenViking 已于 2026-11-10 归档退役，本脚本不再上传任何服务，只写磁盘
 - 状态: 与脚本同目录 hermes_to_viking.state.json (last_message_id + 每文件 md5)
 - cron 用法: no_agent=True, 有新增打印摘要, 无新增静默(exit 0)
 """
@@ -22,18 +22,11 @@ import sys
 import time
 import hashlib
 import datetime
-import urllib.request
-import urllib.error
 
-HERMES_DB = r"C:\Users\xxx13\AppData\Local\hermes\state.db"
-VIKING = "http://127.0.0.1:1933"
-OUT_DIR = r"D:\@kaifa\openviking\data\hermes_sessions"
-RES_BASE = "viking://user/default/resources/hermes_sessions"
+HERMES_DB = r"C:\Users\20200\AppData\Local\hermes\state.db"
+OUT_DIR = r"D:\@kaifa\Obsidian知识库\03 资料库\Hermes会话完整原文"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hermes_to_viking.state.json")
 MAX_MSG_CHARS = 50000          # 单条消息内容截断上限
-SLEEP_BETWEEN_ADDS = 0.35      # 提交间隔(秒), 避免打爆任务队列
-CONFLICT_RETRIES = 15          # 409 busy 重试次数
-CONFLICT_BACKOFF = 8           # 秒
 
 
 def now():
@@ -42,57 +35,6 @@ def now():
 
 def log(*a):
     print(now(), *a, flush=True)
-
-
-def health_ok():
-    try:
-        r = urllib.request.urlopen(VIKING + "/health", timeout=5)
-        return json.loads(r.read()).get("healthy") is True
-    except Exception:
-        return False
-
-
-def api_post(url, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    try:
-        r = urllib.request.urlopen(req, timeout=60)
-        return r.status, json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        try:
-            return e.code, json.loads(e.read().decode())
-        except Exception:
-            return e.code, {}
-
-
-def upload_file(path):
-    """multipart temp_upload → temp_file_id"""
-    boundary = "----hermes" + hashlib.md5(path.encode() + str(time.time()).encode()).hexdigest()
-    with open(path, "rb") as f:
-        data = f.read()
-    fname = os.path.basename(path)
-    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{fname}"\r\n'
-            f'Content-Type: text/markdown\r\n\r\n').encode() + data + f'\r\n--{boundary}--\r\n'.encode()
-    req = urllib.request.Request(VIKING + "/api/v1/resources/temp_upload", data=body,
-                                 headers={"Content-Type": "multipart/form-data; boundary=" + boundary})
-    r = urllib.request.urlopen(req, timeout=120)
-    return json.loads(r.read())["result"]["temp_file_id"]
-
-
-def add_resource(temp_file_id, uri, reason):
-    """添加/更新资源; 409(busy) 重试"""
-    for attempt in range(CONFLICT_RETRIES):
-        code, resp = api_post(VIKING + "/api/v1/resources",
-                              {"temp_file_id": temp_file_id, "to": uri, "reason": reason})
-        if code == 200:
-            return True
-        if code == 409:
-            time.sleep(CONFLICT_BACKOFF)
-            continue
-        log(f"  !! add 失败 HTTP {code}: {str(resp)[:200]}")
-        return False
-    log(f"  !! add 重试耗尽: {uri}")
-    return False
 
 
 def fmt_ts(ts):
@@ -183,9 +125,6 @@ def main():
 
 
 def _main():
-    if not health_ok():
-        print(f"[{now()}] OpenViking 不可达 ({VIKING}), 跳过本次导出")
-        return 1
     if not os.path.exists(HERMES_DB):
         print(f"[{now()}] state.db 不存在: {HERMES_DB}")
         return 1
@@ -223,7 +162,7 @@ def _main():
         day = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d") if r["timestamp"] and r["timestamp"] > 0 else "unknown"
         buckets.setdefault((r["session_id"], day), set()).add(r["id"])
 
-    added = changed = 0
+    changed = 0
     for (sid, day), _ids in sorted(buckets.items()):
         day_dir = os.path.join(OUT_DIR, sid)
         os.makedirs(day_dir, exist_ok=True)
@@ -249,28 +188,16 @@ def _main():
             continue
 
         os.replace(tmp, path)
-        rel = os.path.relpath(path, OUT_DIR).replace("\\", "/")
-        uri = f"{RES_BASE}/{rel}"
-        try:
-            tid = upload_file(path)
-            ok = add_resource(tid, uri, "Hermes 会话自动增量导出")
-            if ok:
-                st["files"][path] = new_md5
-                changed += 1
-                log(f"  ✓ {rel}")
-            else:
-                st["files"].pop(path, None)  # 失败则不记 md5, 下次重试
-        except Exception as e:
-            log(f"  !! 上传失败 {rel}: {e}")
-            st["files"].pop(path, None)
-        time.sleep(SLEEP_BETWEEN_ADDS)
+        st["files"][path] = new_md5
+        changed += 1
+        log(f"  ✓ {os.path.relpath(path, OUT_DIR)}")
 
     st["last_message_id"] = max(r["id"] for r in new)
     save_state(st)
     con.close()
 
     n = len(new)
-    print(f"[{now()}] Hermes→Viking 增量导出完成: 新消息 {n} 条, 涉及会话 {len(sess_ids)} 个, "
+    print(f"[{now()}] Hermes→Obsidian 增量导出完成: 新消息 {n} 条, 涉及会话 {len(sess_ids)} 个, "
           f"更新文件 {changed} 个 (游标 → {st['last_message_id']})")
     return 0
 

@@ -121,6 +121,12 @@ def render_md(row, rel_path, lib_name):
 
 
 def main():
+    # 2026-11-10: OpenViking 已归档退役并删除，本脚本停用（保留作历史参考）。
+    print(f"[{now()}] OpenViking 已于 2026-11-10 退役，导出已停用；检索直接用 gongzuo FTS5")
+    return 0
+
+
+def _legacy_main():
     ap = argparse.ArgumentParser(description="gongzuo 索引库 → OpenViking 增量导出")
     ap.add_argument("--db", required=True, help="gongzuo SQLite 索引库路径")
     ap.add_argument("--root", required=True, help="被索引的根目录(用于算相对路径)")

@@ -92,23 +92,26 @@ list 顶层格式（如蒸馏中间产物）无 messages 字段会自动跳过�
 ## 模式4: 每日自动增量索引 + 数据汇总（cron，2026-08-23 起统一由 worklife_daily_index.py 管）
 
 已配置 Hermes cron 任务 `每日增量抓取合并(BDSync+XHP+会话)→Viking`（job 9ef628304b40，每天 **01:00**，script=hermes/scripts/worklife_daily_index.py），
-一次跑完**索引+OCR+描述+导出Viking+数据汇总**（原 04:00 gongzuo 增量索引任务已并入删除，避免重复扫描抢 Dabao-OCR）：
+一次跑完**索引+OCR+描述+导出Viking+数据汇总**（原 04:00 gongzuo 增量索引任务已并入删除，避免重复扫描抢 Dabao-OCR）。
+**2026-11-10 注：OpenViking 已归档退役，Viking 导出步骤停用；索引、OCR、汇编仍正常。**
 
 - 三路串行：
-  - BaiduSyncdisk（file_index.db）→ 增量索引+OCR+智谱描述 → `lib_to_viking.py` 导出
+  - BaiduSyncdisk（file_index.db）→ 增量索引+OCR+智谱描述（2026-11-10 起不再导出，检索走本地 FTS5）
   - XHP-知识库（xhp_kb.db）→ 同上
-  - Hermes 会话（state.db）→ `hermes_to_viking.py`
+  - Hermes 会话（state.db）→ `hermes_to_viking.py`（现只写 Obsidian `03 资料库/Hermes会话完整原文`）
 - 每路 watchdog：有新增/失败才通知，无变化静默
 - **数据汇总（原 04:00 职责并入）**：索引链路无异常时，追加 `gongzuo_assembly.py`（→ @数据汇总 7 份汇编 md）
   和 `gen_skill_list.py`（→ 06-后装技能清单，每日全量重生成）
 - **并发互斥锁**（2026-08-23 新增）：worklife 写 PID 锁 `D:\@kaifa\gongzuo-data\worklife_daily.lock`，
   死锁残留自动清理；04:00 已删除无并发方，锁仍保留防手动重入
 - 脚本本体在**技能 scripts/**（`worklife_daily_index.py` + `lib_to_viking.py`，cron 入口是 hermes/scripts 的同名薄副本），改逻辑改技能目录再同步副本
-- 健康检查：每周一 06:30 cron `gongzuo_health_check.py`（job 263e2e784a0b）——库存在+文件数阈值+FTS一致性+Viking可达，全部正常静默，异常才通知
+- 健康检查：每周一 06:30 cron `gongzuo_health_check.py`（job 263e2e784a0b）——库存在+文件数阈值+FTS一致性，全部正常静默，异常才通知
 
-## 模式5: Viking 知识库导出（lib_to_viking.py，2026-08-23）
+## 模式5: Viking 知识库导出（已停用，2026-11-10）
 
-把任意 gongzuo 索引库的内容导出到 OpenViking 记忆库（127.0.0.1:1933），供语义检索/跨会话召回。**参数化通用版**，替代旧的 bdsync/xhp 专用脚本：
+**OpenViking 已归档退役，本节仅作历史记录；`lib_to_viking.py` 不再执行。** 索引数据保留在本地 SQLite，检索直接用 gongzuo 的 FTS5。
+
+历史说明：把任意 gongzuo 索引库的内容导出到 OpenViking 记忆库（127.0.0.1:1933），供语义检索/跨会话召回。**参数化通用版**，替代旧的 bdsync/xhp 专用脚本：
 
 ```bash
 # 导出一个库（首次全量，之后增量只传新增/变更，指纹=mtime+size）

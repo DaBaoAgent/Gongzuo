@@ -6,6 +6,10 @@ viking add 同步处理(~1.1s/个, 即时入库), 无需等队列, 直接用 --m
 """
 import os, sys, time, subprocess, datetime
 
+# 2026-11-10: OpenViking 已归档退役并删除，本编排脚本停用（保留作历史参考）。
+print("[viking_drain] OpenViking 已于 2026-11-10 退役，脚本停用")
+raise SystemExit(0)
+
 SCRIPTS = r"C:\Users\xxx13\AppData\Local\hermes\skills\media\gongzuo\scripts"
 LIB = os.path.join(SCRIPTS, "lib_to_viking.py")
 BATCH = 800              # BDSync 每轮上限
